@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WeChat Publisher</title>
+    <link rel="stylesheet" href="{% static 'publisher/css/styles.css' %}"> <style>
+        body { font-family: sans-serif; padding: 20px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; }
+        input[type="file"], button { padding: 8px 12px; }
+        #status { margin-top: 20px; padding: 10px; border: 1px solid #ccc; background-color: #f9f9f9; }
+        #preview-link, #confirm-button { display: none; /* Initially hidden */ margin-top: 10px; }
+        .error { color: red; }
+        .success { color: green; }
+        button:disabled { cursor: not-allowed; opacity: 0.6; }
+    </style>
+</head>
+<body>
+
+    <h1>Upload Markdown for WeChat</h1>
+
+    <form id="upload-form" enctype="multipart/form-data">
+        {% csrf_token %} <div class="form-group">
+            <label for="markdown_file">Markdown File (.md):</label>
+            <input type="file" id="markdown_file" name="markdown_file" accept=".md,.markdown" required>
+        </div>
+        <div class="form-group">
+            <label for="cover_image">Cover Image (JPG, PNG):</label>
+            <input type="file" id="cover_image" name="cover_image" accept="image/jpeg,image/png" required>
+        </div>
+        <button type="submit" id="submit-button">Process & Preview</button>
+    </form>
+
+    <div id="status">
+        <p>Please upload your files and click "Process & Preview".</p>
+    </div>
+
+    <div id="preview-section">
+         <a href="#" id="preview-link" target="_blank">View Preview</a>
+         <button id="confirm-button" disabled>Confirm & Publish to WeChat Drafts</button>
+         <p id="publish-status"></p> </div>
+
+    <script src="{% static 'publisher/js/app.js' %}"></script>
+</body>
+</html>

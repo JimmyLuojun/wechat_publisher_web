@@ -1,0 +1,35 @@
+[tool.poetry]
+name = "wechat-publisher-web"
+version = "0.1.0"
+description = "Django app for publishing articles to WeChat"
+authors = ["Jimmy <15828061015@163.com>"]
+license = "MIT"
+readme = "README.md"
+packages = [
+    { include = "wechat_publisher_web" },
+    { include = "publisher" },
+    { include = "publishing_engine" }
+]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+django = "^4.2"
+djangorestframework = "^3.14"
+celery = "^5.3"
+redis = "^5.0"
+requests = "^2.31"
+python-dotenv = "^1.0.0"
+markdown = "^3.4"
+beautifulsoup4 = "^4.12"
+pydantic = "^2.0" 
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.5"
+pytest-django = "^4.11.1"
+black = "^25.1.0"
+ruff = "^0.11.5"
+
