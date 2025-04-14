@@ -73,18 +73,17 @@ def build_draft_payload(metadata: Dict[str, Any], html_content: str, thumb_media
 
     digest = generate_digest(metadata, html_content)
 
-    article_payload = {
+    article_data = {
         "title": title,
         "author": metadata.get("author", ""),
         "digest": digest,
         "content": html_content,
         "content_source_url": metadata.get("content_source_url", ""),
         "thumb_media_id": thumb_media_id,
-        "need_open_comment": int(metadata.get("need_open_comment", 0)),
-        "only_fans_can_comment": int(metadata.get("only_fans_can_comment", 0))
+        "need_open_comment": metadata.get("need_open_comment", 0),
+        "only_fans_can_comment": metadata.get("only_fans_can_comment", 0),
     }
 
-    payload = {"articles": [article_payload]}
     logger.info("WeChat draft payload successfully built.")
 
-    return payload
+    return article_data

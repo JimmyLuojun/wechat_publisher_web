@@ -16,18 +16,15 @@ Including another URLconf
 """
 
 from django.contrib import admin
-from django.urls import path, include # Add include
-from django.conf import settings # Add this
-from django.conf.urls.static import static # Add this
+from django.urls import path, include
+from django.conf import settings
+from django.conf.urls.static import static
 
 urlpatterns = [
-    path('admin/', admin.site.urls),
-    path('publisher/', include('publisher.urls')), # Example: Include publisher app URLs under /publisher/
-    # Add other paths as needed
+    path("admin/", admin.site.urls),
+    path("publisher/", include("publisher.urls", namespace="publisher")),
 ]
 
-# Add this block to serve media files during development
 if settings.DEBUG:
+    urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
     urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
-    # Optionally add static files serving if needed, though runserver usually handles this
-    # urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
