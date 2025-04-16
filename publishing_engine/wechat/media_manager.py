@@ -1,126 +1,132 @@
-# publishing_engine/wechat/media_manager.py
-import logging
-import json
-import hashlib
-from pathlib import Path
-from typing import Dict, Optional
+# publishing_engine/core/metadata_reader.py
 
-# Import the actual API upload functions
-from .api import upload_thumb_media, upload_content_image
+import yaml
+import logging
+from pathlib import Path
+from typing import Tuple, Optional, Dict, Any
 
 logger = logging.getLogger(__name__)
 
-CACHE_FILENAME = "data/output/media_cache.json" # Default cache file path
-
-class MediaManager:
-    """Manages uploading media to WeChat, using a cache to avoid duplicates."""
-
-    def __init__(self, cache_file_path: str | Path = CACHE_FILENAME):
-        self.cache_file_path = Path(cache_file_path)
-        self.cache: Dict[str, str] = self._load_cache() # {file_hash: media_id_or_url}
-
-    def _load_cache(self) -> Dict[str, str]:
-        """Loads the media cache from the JSON file."""
+# Assuming your file_handler is available, otherwise use standard open
+try:
+    from ...utils.file_handler import read_file # Adjust import path if needed
+    # If using the imported read_file, ENSURE IT uses encoding='utf-8'
+    logger.info("Using imported read_file from utils.file_handler.")
+except (ImportError, ModuleNotFoundError):
+    logger.warning("Could not import custom read_file, using standard open with UTF-8.")
+    # Fallback definition explicitly uses UTF-8
+    def read_file(path: Path | str) -> str:
+        """Fallback function to read a file using UTF-8."""
         try:
-            if self.cache_file_path.is_file():
-                logger.info(f"Loading media cache from: {self.cache_file_path}")
-                with open(self.cache_file_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+            file_path = Path(path)
+            return file_path.read_text(encoding='utf-8') # Explicit UTF-8
+        except FileNotFoundError:
+            logger.error(f"Fallback read_file: File not found at {path}")
+            raise # Re-raise FileNotFoundError
+        except Exception as e:
+            logger.error(f"Fallback read_file: Error reading {path}: {e}")
+            # Re-raise as a runtime error for consistent handling upstream
+            raise RuntimeError(f"Fallback read_file failed for {path}") from e
+
+def extract_metadata_and_content(filepath: str | Path) -> Tuple[Dict[str, Any], str]:
+    """
+    Reads Markdown (UTF-8), extracts/validates YAML frontmatter, returns metadata & body.
+    Ensures metadata is always a dictionary (empty if none found/invalid non-critical).
+
+    Args:
+        filepath: Path to the markdown file.
+
+    Returns:
+        Tuple[Dict[str, Any], str]: (Validated metadata dict (potentially empty), Markdown body string).
+
+    Raises:
+        FileNotFoundError: If the markdown file does not exist.
+        ValueError: For format errors or missing required metadata fields.
+        yaml.YAMLError: For invalid YAML syntax.
+        RuntimeError: For file reading issues.
+    """
+    path = Path(filepath)
+    logger.info(f"Extracting metadata and content from: {path}")
+
+    # Ensure file is read with UTF-8 using the (potentially fallback) read_file
+    full_content = read_file(path)
+
+    metadata: Dict[str, Any] = {}
+    body_content: str = full_content # Default: assume all content is body
+    YAML_DELIMITER = '---'
+
+    # Check for standard '---' delimiters
+    if full_content.startswith(YAML_DELIMITER + '\n') or full_content.startswith(YAML_DELIMITER + '\r\n'):
+        # Find the end delimiter '---' followed by a newline
+        # +1 for the newline after the first delimiter
+        end_delimiter_search_start = len(YAML_DELIMITER) + 1
+        end_delimiter_pos = full_content.find('\n' + YAML_DELIMITER + '\n', end_delimiter_search_start)
+        if end_delimiter_pos == -1: # Try with Windows newline
+             end_delimiter_pos = full_content.find('\r\n' + YAML_DELIMITER + '\r\n', end_delimiter_search_start)
+
+        if end_delimiter_pos != -1:
+            # Extract YAML block
+            yaml_part = full_content[len(YAML_DELIMITER)+1 : end_delimiter_pos].strip()
+            # Extract body content (start after the ending delimiter line)
+            # Calculate start based on delimiter length and preceding/following newlines
+            body_content_start = end_delimiter_pos + len(YAML_DELIMITER) + 2 # Assuming \n---\n
+            if full_content[end_delimiter_pos:body_content_start] == '\r\n' + YAML_DELIMITER + '\r\n':
+                body_content_start += 2 # Adjust for \r\n on both sides if needed
+
+            body_content = full_content[body_content_start:]
+            logger.debug(f"Found YAML delimiters. YAML part length: {len(yaml_part)}, Body content start index: {body_content_start}")
+
+            if not yaml_part:
+                logger.debug("Empty content between YAML frontmatter delimiters.")
+                metadata = {}
             else:
-                logger.info("Media cache file not found, starting with empty cache.")
-                return {}
-        except (json.JSONDecodeError, OSError) as e:
-            logger.error(f"Failed to load media cache ({self.cache_file_path}): {e}. Starting with empty cache.")
-            return {}
+                try:
+                    loaded_yaml = yaml.safe_load(yaml_part)
+                    if isinstance(loaded_yaml, dict):
+                        metadata = loaded_yaml
+                        logger.debug("Successfully parsed YAML frontmatter.")
+                    elif loaded_yaml is None:
+                        metadata = {}
+                        logger.debug("YAML frontmatter parsed as None (empty).")
+                    else:
+                        # Treat non-dict YAML as an error or warning
+                        logger.error(f"YAML frontmatter content in {path} is not a dictionary (key-value pairs). Type: {type(loaded_yaml)}")
+                        # Option 1: Raise Error
+                        raise ValueError("YAML frontmatter content must parse to a dictionary.")
+                        # Option 2: Treat as empty metadata (less strict)
+                        # metadata = {}
+                except yaml.YAMLError as e:
+                    error_msg = f"Invalid YAML syntax in frontmatter of {path}: {e}"
+                    logger.error(error_msg)
+                    raise e # Re-raise YAML error
 
-    def _save_cache(self) -> None:
-        """Saves the current media cache to the JSON file."""
-        try:
-            # Ensure parent directory exists
-            self.cache_file_path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.cache_file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.cache, f, indent=2, ensure_ascii=False)
-            logger.debug(f"Media cache saved to: {self.cache_file_path}")
-        except OSError as e:
-            logger.error(f"Failed to save media cache ({self.cache_file_path}): {e}")
+        else:
+            logger.warning(f"Found starting '---' but no valid closing '---' delimiter in {path}. Treating all as body content.")
+            body_content = full_content
+            metadata = {}
+    else:
+        logger.debug(f"No YAML frontmatter found (doesn't start with '---'). Treating all content as body.")
+        body_content = full_content
+        metadata = {}
 
-    def _calculate_file_hash(self, file_path: Path) -> str:
-        """Calculates the SHA-256 hash of a file's content."""
-        hasher = hashlib.sha256()
-        try:
-            with open(file_path, 'rb') as f:
-                while True:
-                    chunk = f.read(4096) # Read in chunks
-                    if not chunk:
-                        break
-                    hasher.update(chunk)
-            return hasher.hexdigest()
-        except OSError as e:
-            logger.error(f"Failed to read file for hashing ({file_path}): {e}")
-            raise RuntimeError(f"Could not read file for hashing: {file_path}") from e
+    # --- Metadata Validation ---
+    # Define required fields within the function or import from constants
+    REQUIRED_FIELDS = ["title", "cover_image_path"] # Example required fields
 
-    def get_or_upload_thumb_media(
-        self,
-        access_token: str,
-        thumb_path: str | Path,
-        base_url: str
-        ) -> str:
-        """Gets existing thumb_media_id from cache or uploads the thumbnail."""
-        path = Path(thumb_path)
-        if not path.is_file():
-             raise FileNotFoundError(f"Thumbnail image file not found: {path}")
+    missing_fields = [field for field in REQUIRED_FIELDS if field not in metadata or not metadata[field]]
+    if missing_fields:
+        # If metadata was expected (i.e., delimiters were present) but fields are missing
+        if full_content.startswith(YAML_DELIMITER):
+             error_msg = f"Missing or empty required metadata fields: {missing_fields} in {filepath}"
+             logger.error(error_msg)
+             raise ValueError(error_msg)
+        else:
+             # No frontmatter found, and it seems optional, so proceed with empty metadata
+             logger.info(f"No frontmatter found in {filepath}, required fields check skipped.")
+             metadata = {} # Ensure it's an empty dict
 
-        try:
-            file_hash = self._calculate_file_hash(path)
-            if file_hash in self.cache:
-                cached_id = self.cache[file_hash]
-                logger.info(f"Found cached thumb_media_id for {path.name}: {cached_id}")
-                return cached_id
+    if metadata: # Log only if metadata was successfully parsed and validated
+        logger.info(f"Metadata extracted and validated successfully from {filepath}")
 
-            # Not in cache, upload required
-            logger.info(f"No cache found for {path.name}. Uploading thumbnail...")
-            media_id = upload_thumb_media(access_token, path, base_url) # Call actual API
+    return metadata, body_content.strip()
 
-            # Update cache and save
-            self.cache[file_hash] = media_id
-            self._save_cache()
-            return media_id
-
-        except Exception as e:
-            # Catch potential errors during hashing or upload
-            logger.error(f"Failed to get or upload thumbnail {path.name}: {e}")
-            # Re-raise to let the main error handler deal with it
-            # Ensure specific error types are maintained if possible
-            raise e
-
-
-    def get_or_upload_content_image_url(
-        self,
-        access_token: str,
-        image_path: str | Path,
-        base_url: str
-        ) -> str:
-        """Gets existing WeChat image URL from cache or uploads the content image."""
-        path = Path(image_path)
-        if not path.is_file():
-             raise FileNotFoundError(f"Content image file not found: {path}")
-
-        try:
-            file_hash = self._calculate_file_hash(path)
-            if file_hash in self.cache:
-                cached_url = self.cache[file_hash]
-                logger.info(f"Found cached URL for {path.name}: {cached_url}")
-                return cached_url
-
-            # Not in cache, upload required
-            logger.info(f"No cache found for {path.name}. Uploading content image...")
-            img_url = upload_content_image(access_token, path, base_url) # Call actual API
-
-            # Update cache and save
-            self.cache[file_hash] = img_url
-            self._save_cache()
-            return img_url
-
-        except Exception as e:
-            logger.error(f"Failed to get or upload content image {path.name}: {e}")
-            raise e

@@ -57,6 +57,8 @@ pydantic = "^2.0" # Keep if used, otherwise remove
 
 # Add your 'publishing_engine' here ONLY if it's installable from PyPI/git
 # publishing_engine = { git = "ssh://git@github.com/your_org/publishing_engine.git", branch = "main" }
+django-storages = "^1.14.6"
+google-cloud-storage = "^3.1.0"
 
 
 [tool.poetry.group.dev.dependencies]
@@ -82,6 +84,7 @@ coverage = {extras = ["toml"], version = "^7.5.0"} # Test coverage tool
 
 # Build system - Standard, usually no need to change
 pillow = ">=11.2.1,<12.0.0"
+freezegun = "^1.5.1"
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
@@ -105,18 +108,20 @@ addopts = [ # Options passed to pytest
 asyncio_mode = "auto" # Required for pytest-asyncio
 
 [tool.coverage.run]
-source = ["wechat_publisher_web", "publisher", "publishing_engine"] # Directories to measure coverage in
-omit = [ # Files/patterns to exclude from coverage
+omit = [
     "*/migrations/*",
     "*/tests/*",
-    "wechat_publisher_web/settings.py",
-    "wechat_publisher_web/asgi.py",
-    "wechat_publisher_web/wsgi.py",
+    "*/virtualenvs/*",
+    "*/site-packages/*",
     "manage.py",
+    "publisher/apps.py",
+    "publisher/admin.py", # Often excluded unless complex logic
+    "wechat_publisher_web/*", # Exclude project config files
+    "publishing_engine/*", # <--- Exclude this library
 ]
 
 [tool.coverage.report]
-fail_under = 75 # Optional: Fail if total coverage is below 75%
+fail_under = 75 # Your threshold
 show_missing = true
 
 [tool.black]

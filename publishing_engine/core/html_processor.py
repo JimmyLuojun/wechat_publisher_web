@@ -1,183 +1,211 @@
 # publishing_engine/core/html_processor.py
 import re
 from pathlib import Path
-from typing import Callable, List
-from markdown import markdown
-from bs4 import BeautifulSoup, Tag
+from typing import Callable, Optional
+from markdown import Markdown
+from bs4 import BeautifulSoup, NavigableString
 import logging
+
+# Import settings to know where content images are saved by services.py
+from django.conf import settings
 
 logger = logging.getLogger(__name__)
 
-# Assuming file_handler is correctly placed relative to this file
-try:
-    from ..utils.file_handler import read_file
-except ImportError:
-    logger.error("Failed relative import for ..utils.file_handler. Check structure.")
-    def read_file(path): raise NotImplementedError("read_file could not be imported")
-
-# Regex to identify image src attributes that are likely filenames to be looked up
-# It matches strings that DO NOT start with http://, https://, or data:
-# We assume these are filenames to be found in the content_images_dir.
 LOCAL_IMAGE_SRC_PATTERN = re.compile(r"^(?!https?://|data:).+", re.IGNORECASE)
 
+# --- _read_file (Keep as is) ---
+def _read_file(file_path: Path | str) -> str:
+    """Reads file content, ensuring UTF-8 encoding."""
+    try:
+        return Path(file_path).read_text(encoding='utf-8')
+    except FileNotFoundError:
+        logger.error(f"File not found: {file_path}")
+        raise
+    except Exception as e:
+        logger.exception(f"Error reading file {file_path}: {e}")
+        raise
+
+# --- _find_and_replace_local_images (Keep as is - it's working based on logs) ---
 def _find_and_replace_local_images(
     soup: BeautifulSoup,
-    content_images_dir: Path, # Directory where uploaded content images are stored
-    image_uploader: Callable[[Path], str]
+    markdown_dir: Path,
+    image_uploader: Callable[[Path], Optional[str]]
 ) -> None:
     """
-    Finds <img> tags with potential local filenames in 'src', looks for them
-    in the `content_images_dir`, uploads found images using the provided
-    callback, and replaces the src attribute.
-
-    Args:
-        soup: BeautifulSoup object representing the parsed HTML content.
-        content_images_dir: The absolute path to the directory where uploaded
-                           content images are stored.
-        image_uploader: A callback function that takes a local image Path obj
-                        and returns the uploaded image URL string.
-
-    Raises:
-        FileNotFoundError: If an image specified in the Markdown src cannot be
-                           found in the `content_images_dir`, or if the directory itself doesn't exist.
+    Find local image sources, attempt to resolve paths (relative to MD first,
+    then central content_images dir), call uploader, and replace src.
     """
-    logger.info(f"Searching for local image filenames in HTML content, checking against directory: {content_images_dir}")
-    images_found: List[Tag] = soup.find_all('img')
-    images_processed_count = 0
+    logger.info("Searching for local images in HTML to replace with WeChat URLs...")
+    images_processed = 0
+    images_failed = 0
+    content_images_subfolder = 'uploads/content_images'
+    central_image_dir = Path(settings.MEDIA_ROOT) / content_images_subfolder
 
-    # Ensure the designated content images directory exists
-    if not content_images_dir.is_dir():
-        error_msg = f"Provided content_images_dir does not exist or is not a directory: {content_images_dir}"
-        logger.error(error_msg)
-        raise FileNotFoundError(error_msg)
+    for img in soup.find_all('img'):
+        src = img.get('src')
+        img['alt'] = img.get('alt', '') # Ensure alt attribute
 
-    for img_tag in images_found:
-        src = img_tag.get('src')
+        if not src or not LOCAL_IMAGE_SRC_PATTERN.match(src):
+            continue
 
-        # Check if src looks like a filename we should process
-        if src and LOCAL_IMAGE_SRC_PATTERN.match(src):
-            # Assume src is a filename. Construct the expected path within the content images dir.
-            # Extract filename part using Path().name for safety against accidental relative paths in src
-            image_filename = Path(src).name
-            local_image_path = (content_images_dir / image_filename).resolve()
-            logger.debug(f"Potential local image filename: '{image_filename}'. Looking for it at: {local_image_path}")
+        logger.debug(f"Found potential local image source: '{src}'")
+        resolved_image_path: Optional[Path] = None
+        image_filename = Path(src).name
 
-            # Check if the image file exists in the designated directory
-            if not local_image_path.is_file():
-                error_msg = f"Content image file not found in designated directory: {local_image_path} (original src: '{src}')"
-                logger.error(error_msg)
-                # Raise error to stop processing if an image is missing
-                raise FileNotFoundError(error_msg)
+        # 1. Try relative to markdown dir
+        try:
+            path_relative_to_md = (markdown_dir / src).resolve(strict=True)
+            if path_relative_to_md.is_file():
+                resolved_image_path = path_relative_to_md
+                logger.debug(f"Resolved image '{src}' relative to markdown dir: {resolved_image_path}")
+        except FileNotFoundError:
+            logger.debug(f"Image '{src}' not found relative to markdown dir {markdown_dir}.")
+        except Exception as e:
+            logger.warning(f"Error resolving image '{src}' relative to markdown dir: {e}")
 
+        # 2. Try central content_images dir by filename stem/suffix
+        if not resolved_image_path:
+            logger.debug(f"Attempting to find image filename '{image_filename}' in central dir: {central_image_dir}")
+            found_in_central = False
+            if central_image_dir.is_dir():
+                src_path = Path(src)
+                src_stem = src_path.stem
+                src_suffix = src_path.suffix
+                try:
+                    # Use glob to find files potentially saved with UUIDs
+                    possible_matches = list(central_image_dir.glob(f"{src_stem}*{src_suffix}"))
+                    if possible_matches:
+                        # Assuming the first match is correct (might need refinement if duplicates occur)
+                        match_path = possible_matches[0].resolve(strict=True)
+                        if match_path.is_file():
+                             resolved_image_path = match_path
+                             logger.debug(f"Resolved image '{src}' (matched stem/suffix) in central content dir: {resolved_image_path}")
+                             found_in_central = True
+                except FileNotFoundError:
+                     logger.debug(f"Glob match for '{image_filename}' resolved, but file check failed.")
+                except Exception as e:
+                     logger.warning(f"Error searching for '{image_filename}' in central content dir: {e}")
+
+            if not found_in_central:
+                 logger.debug(f"Image filename '{image_filename}' not found in central content dir {central_image_dir}.")
+
+        # Upload and Replace
+        if resolved_image_path:
             try:
-                # Call the provided uploader function to get the WeChat URL
-                wechat_url = image_uploader(local_image_path)
-
-                if wechat_url: # Ensure the uploader returned a valid URL
-                    logger.debug(f"Replacing src '{src}' with uploaded URL '{wechat_url}'")
-                    img_tag['src'] = wechat_url # Update the src attribute in the soup
-                    images_processed_count += 1
+                logger.debug(f"Calling image uploader for: {resolved_image_path}")
+                wechat_url = image_uploader(resolved_image_path)
+                if wechat_url:
+                    img['src'] = wechat_url
+                    images_processed += 1
+                    logger.debug(f"Replaced '{src}' with WeChat URL: '{wechat_url}'")
                 else:
-                    logger.warning(f"Image uploader returned empty URL for {local_image_path}. Keeping original src: '{src}'")
-
+                    logger.warning(f"Callback failed for image path: {resolved_image_path} (original src: '{src}'). Keeping original src.")
+                    images_failed += 1
             except Exception as e:
-                # Catch potential errors during the image_uploader call
-                logger.exception(f"Error calling image_uploader for {local_image_path}: {e}. Keeping original src: '{src}'")
-                # Depending on requirements, could skip replacement or re-raise
+                logger.exception(f"Error during callback/replacement for image path {resolved_image_path} (original src='{src}'): {e}")
+                images_failed += 1
+        else:
+            logger.error(f"Local image file could not be located for src='{src}'. Checked relative to MD and in central dir. Keeping original src.")
+            images_failed += 1
 
-    logger.info(f"Finished processing content images. Replaced sources for {images_processed_count} images found in {content_images_dir}.")
+    logger.info(f"Image processing complete. Replaced: {images_processed}, Failed/Skipped: {images_failed}.")
 
 
+# --- _wrap_heading_content (Keep as is) ---
 def _wrap_heading_content(soup: BeautifulSoup) -> None:
-    """Wraps heading content with spans for CSS styling."""
-    logger.debug("Wrapping heading content with prefix/content/suffix spans...")
-    headings: List[Tag] = soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6'])
-    for header in headings:
-        original_content_html = ''.join(str(content_part) for content_part in header.contents)
+    """Wrap headings in span elements for consistent styling."""
+    for header in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+        # Check if already wrapped to prevent double wrapping
+        if header.find('span', class_='content', recursive=False):
+            continue
+        original_attrs = header.attrs # Preserve original attributes like class
+        content_html = ''.join(str(c) for c in header.contents)
         header.clear()
-        header.append(soup.new_tag('span', attrs={'class': 'prefix'}))
-        content_span = soup.new_tag('span', attrs={'class': 'content'})
-        # Use html.parser for parsing the fragment back into the span
-        content_span.append(BeautifulSoup(original_content_html, 'html.parser'))
+        header.attrs = original_attrs # Restore attributes
+        header.append(soup.new_tag('span', **{'class': 'prefix'}))
+        content_span = soup.new_tag('span', **{'class': 'content'})
+        # Parse the content HTML to handle nested tags correctly
+        parsed_content = BeautifulSoup(content_html or "", 'html.parser')
+        # Append children of parsed content to the span to avoid extra body/html tags
+        for child in list(parsed_content.contents):
+            content_span.append(child.extract())
         header.append(content_span)
-        header.append(soup.new_tag('span', attrs={'class': 'suffix'}))
-    logger.debug(f"Finished wrapping content for {len(headings)} headings.")
+        header.append(soup.new_tag('span', **{'class': 'suffix'}))
 
 
+# --- _remove_heading_ids (Keep as is) ---
+def _remove_heading_ids(soup: BeautifulSoup) -> None:
+    """Remove 'id' attributes from heading tags."""
+    for header in soup.find_all(['h1', 'h2', 'h3', 'h4', 'h5', 'h6']):
+        if header.has_attr('id'):
+            del header['id']
+
+
+# --- _extract_body_content (Keep as is) ---
+def _extract_body_content(soup: BeautifulSoup) -> str:
+    """Extracts the inner HTML of the body tag, or the whole soup if no body."""
+    body = soup.find('body')
+    if body:
+        return body.decode_contents() # Get inner HTML of body
+    else:
+        # If markdown didn't create a full document, decode the whole soup's content
+        return "".join(str(content) for content in soup.contents)
+
+
+# --- MODIFIED process_html_content ---
 def process_html_content(
     md_content: str,
-    css_path: Path | str,
-    content_images_dir: Path, # Changed from markdown_file_path
-    image_uploader: Callable[[Path], str]
+    css_path: Optional[Path | str],
+    markdown_file_path: Path | str,
+    image_uploader: Callable[[Path], Optional[str]]
 ) -> str:
     """
-    Converts Markdown string to a complete, styled HTML5 document string.
-    Includes CSS, processes local image filenames found in content_images_dir,
-    and wraps headings.
-
-    Args:
-        md_content: The raw Markdown body content string.
-        css_path: Path object or string path to the CSS file.
-        content_images_dir: Absolute path to the directory containing uploaded content images.
-        image_uploader: Callback function to upload local images and get their URLs.
-
-    Returns:
-        A string containing a full HTML5 document.
-
-    Raises:
-        FileNotFoundError: If the CSS file or expected content images are not found.
-        Exception: Can re-raise exceptions from markdown processing or image uploading.
+    Convert markdown to styled HTML suitable for WeChat, mimicking the original script's output structure.
     """
-    logger.info("Starting full HTML processing pipeline...")
-    css_path = Path(css_path)
-    # markdown_dir = Path(markdown_file_path).parent # No longer needed for image lookup
+    logger.info("Starting HTML processing with image uploader callback...")
+    markdown_dir = Path(markdown_file_path).parent
+    logger.info(f"Markdown directory set to: {markdown_dir}")
 
-    logger.debug("Converting Markdown to HTML fragment...")
-    try:
-        html_body_fragment = markdown(md_content, output_format='html5', extensions=[
-            'extra', 'codehilite', 'toc', 'fenced_code', 'tables'
-        ])
-    except Exception as e:
-        logger.exception("Error during Markdown conversion.")
-        raise
+    # Initialize Markdown processor
+    md_processor = Markdown(output_format='html5', extensions=[
+        'extra',          # Includes features like tables, abbr, def_list, footnotes
+        'codehilite',     # Syntax highlighting (requires Pygments)
+        'toc',            # Table of contents (though often not used directly in WeChat)
+        'fenced_code',    # GitHub-style code blocks
+        'tables',         # Explicitly ensure tables are processed
+    ])
 
-    logger.debug("Parsing HTML fragment with BeautifulSoup (lxml)...")
-    soup = BeautifulSoup(html_body_fragment, 'lxml')
+    # Convert Markdown to HTML fragment
+    html_body = md_processor.convert(md_content)
 
-    # Process content: Wrap headings, Find/replace images using content_images_dir
-    _wrap_heading_content(soup)
-    # Pass the directory where content images are stored
-    _find_and_replace_local_images(soup, content_images_dir, image_uploader)
+    # Parse the HTML with BeautifulSoup
+    soup = BeautifulSoup(html_body, 'lxml') # Use lxml for robustness
 
-    logger.debug(f"Reading CSS content from: {css_path}")
-    try:
-        css_content = read_file(css_path).strip()
-        if not css_content: logger.warning(f"CSS file is empty: {css_path}")
-    except FileNotFoundError:
-        logger.error(f"CSS file not found: {css_path}")
-        raise
-    except Exception as e:
-        logger.exception(f"Failed to read CSS file: {css_path}")
-        raise
+    # --- Apply HTML transformations ---
+    _remove_heading_ids(soup) # Remove potential conflicting IDs
+    _wrap_heading_content(soup) # Apply heading structure for styling
+    _find_and_replace_local_images(soup, markdown_dir, image_uploader) # Process images
 
-    logger.debug("Constructing final HTML5 document string...")
-    processed_body_content = soup.decode()
-    final_html_document = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Processed Content Preview</title>
-    <style>
-{css_content}
-    </style>
-</head>
-<body>
-    <div id="nice">
-{processed_body_content}
-    </div>
-</body>
-</html>"""
+    # Extract the processed body content
+    body_fragment = _extract_body_content(soup)
 
-    logger.info("HTML processing completed successfully. Returning full HTML document string.")
-    return final_html_document
+    # --- Prepare CSS ---
+    style_tag = "" # Default to no style tag
+    if css_path:
+        try:
+            css_content = _read_file(css_path).strip()
+            # Use type="text/css" for clarity, although browsers usually infer it
+            style_tag = f'<style type="text/css">\n{css_content}\n</style>'
+        except FileNotFoundError:
+            logger.error(f"CSS file not found at {css_path}. Proceeding without CSS.")
+        except Exception as e:
+            logger.exception(f"Error reading CSS file {css_path}. Proceeding without CSS.")
+
+    # --- Construct Final HTML (Matching original structure) ---
+    # Place the <style> tag *before* the main content wrapper <div id="nice">
+    final_html = f"""{style_tag}
+<div id="nice">{body_fragment.strip()}</div>"""
+    # --- End Structure Modification ---
+
+    logger.info("HTML processing completed successfully.")
+    return final_html

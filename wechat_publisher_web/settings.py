@@ -1,38 +1,43 @@
-# /Users/junluo/Documents/wechat_publisher_web/wechat_publisher_web/settings.py
-"""
-Django settings for wechat_publisher_web project.
-... (other imports remain the same) ...
-"""
+# wechat_publisher_web/settings.py
 
 from pathlib import Path
 import os
 from dotenv import load_dotenv
-
-# Load environment variables from .env file
-load_dotenv(os.path.join(Path(__file__).resolve().parent.parent, '.env'))
+import logging # Import logging
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# --- Create cache directory if it doesn't exist ---
+# --- Load .env file ---
+# Ensure you have a .env file in the project root (same level as manage.py)
+# Example .env content:
+# DJANGO_SECRET_KEY='your-secret-key'
+# DEBUG=True
+# ALLOWED_HOSTS=127.0.0.1,localhost
+# WECHAT_APP_ID='your_wechat_app_id'
+# WECHAT_SECRET='your_wechat_secret'
+# GOOGLE_APPLICATION_CREDENTIALS='/path/to/your/gcs-keyfile.json'
+# GS_BUCKET_NAME='your-gcs-bucket-name'
+# GS_PROJECT_ID='your-gcp-project-id'
+# DB_ENGINE='django.db.backends.sqlite3' # or postgresql, mysql
+# DB_NAME='db.sqlite3' # or your db name
+
+dotenv_path = BASE_DIR / '.env'
+load_dotenv(dotenv_path=dotenv_path)
+logger_for_settings = logging.getLogger(__name__) # Use a logger for settings validation
+
+# --- Create cache and log directories if they don't exist ---
 CACHE_DIR = BASE_DIR / 'cache'
+LOG_DIR = BASE_DIR / 'logs'
 CACHE_DIR.mkdir(parents=True, exist_ok=True)
-# ---
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 # Quick-start development settings - unsuitable for production
-# See https://docs.djangoproject.com/en/5.2/howto/deployment/checklist/
-
-# SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-default-key-for-dev')
-
-# SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv('DEBUG', 'False').lower() in ('true', '1', 't')
-
 ALLOWED_HOSTS = os.getenv('ALLOWED_HOSTS', '127.0.0.1,localhost').split(',')
 
-
 # Application definition
-
 INSTALLED_APPS = [
     "django.contrib.admin",
     "django.contrib.auth",
@@ -40,15 +45,16 @@ INSTALLED_APPS = [
     "django.contrib.sessions",
     "django.contrib.messages",
     "django.contrib.staticfiles",
-    "publisher.apps.PublisherConfig", # Ensure your app name is correct
-    "rest_framework",
+    "publisher.apps.PublisherConfig", # Your app
+    "rest_framework",                 # Django REST framework
+    "storages",                       # django-storages app
 ]
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
-    "django.middleware.csrf.CsrfViewMiddleware", # Consider if needed for API views if using sessions
+    "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
@@ -59,7 +65,7 @@ ROOT_URLCONF = "wechat_publisher_web.urls"
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [BASE_DIR / 'templates'],
+        "DIRS": [BASE_DIR / 'templates'], # Project-level templates
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -77,23 +83,18 @@ ASGI_APPLICATION = "wechat_publisher_web.asgi.application"
 
 
 # Database
-# https://docs.djangoproject.com/en/5.2/ref/settings/#databases
-
+# Uses environment variables with defaults for SQLite
 DATABASES = {
     "default": {
         "ENGINE": os.getenv('DB_ENGINE', 'django.db.backends.sqlite3'),
         "NAME": os.getenv('DB_NAME', BASE_DIR / "db.sqlite3"),
-        "USER": os.getenv('DB_USER', ''),
-        "PASSWORD": os.getenv('DB_PASSWORD', ''),
-        "HOST": os.getenv('DB_HOST', ''),
-        "PORT": os.getenv('DB_PORT', ''),
+        # Add other DB settings (USER, PASSWORD, HOST, PORT) as needed from env vars
+        # if not using SQLite
     }
 }
 
 
 # Password validation
-# https://docs.djangoproject.com/en/5.2/ref/settings/#auth-password-validators
-
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator",},
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator",},
@@ -103,75 +104,96 @@ AUTH_PASSWORD_VALIDATORS = [
 
 
 # Internationalization
-# https://docs.djangoproject.com/en/5.2/topics/i18n/
-
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "America/Los_Angeles" # Example: Use your actual timezone
+TIME_ZONE = "America/Los_Angeles" # Adjust to your timezone
 USE_I18N = True
-USE_TZ = True
+USE_TZ = True # Recommended for timezone-aware datetimes
 
 
-# Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/5.2/howto/static-files/
-
+# Static files (CSS, JavaScript, Images) served by Django in development
 STATIC_URL = "/static/"
-STATIC_ROOT = BASE_DIR / 'staticfiles' # Directory for collectstatic
-STATICFILES_DIRS = [BASE_DIR / 'static'] # Directories to find static files
+# Directory where collectstatic will gather files for deployment
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+# Additional locations for static files (project-level static)
+STATICFILES_DIRS = [BASE_DIR / 'static']
 
 
-# Media files (User uploaded files)
-MEDIA_URL = '/media/'
+# Media files (User uploaded files) - Handled by STORAGES['default'] (GCS)
+MEDIA_URL = '/media/' # Base URL for media files (often served directly from GCS)
+# MEDIA_ROOT is less relevant when using cloud storage like GCS for the default backend,
+# but Django might still use it internally for some operations or if you switch backends.
 MEDIA_ROOT = BASE_DIR / 'media'
-
-# Subdirectory within MEDIA_ROOT for content images used in articles
-# Ensure this path component is URL-safe if needed elsewhere
-CONTENT_IMAGES_SUBDIR = os.getenv('CONTENT_IMAGES_SUBDIR', 'uploads/content_images')
 
 
 # Default primary key field type
-# https://docs.djangoproject.com/en/5.2/ref/settings/#default-auto-field
-
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-# WeChat API Settings
+# --- WeChat API Settings ---
 WECHAT_APP_ID = os.getenv('WECHAT_APP_ID')
-WECHAT_SECRET = os.getenv('WECHAT_APP_SECRET')
-WECHAT_BASE_URL = os.getenv('WECHAT_BASE_URL', 'https://api.weixin.qq.com') # Default base URL
-
+WECHAT_SECRET = os.getenv('WECHAT_SECRET')
+WECHAT_BASE_URL = os.getenv('WECHAT_BASE_URL', 'https://api.weixin.qq.com')
 WECHAT_DRAFT_PLACEHOLDER_CONTENT = os.getenv(
     'WECHAT_DRAFT_PLACEHOLDER_CONTENT',
-    '<p>Content is being prepared. Please edit in WeChat backend.</p>'
+    '<p>Content is being prepared...</p>'
 )
-
-# --- Path to the Media Manager Cache ---
-# Use the CACHE_DIR defined earlier
+# Optional: Define path for media cache if used by publishing_engine
 WECHAT_MEDIA_CACHE_PATH = os.getenv('WECHAT_MEDIA_CACHE_PATH', str(CACHE_DIR / 'wechat_media_cache.json'))
 
-# Path to the CSS file for HTML previews (adjust path as needed)
-PREVIEW_CSS_FILE_PATH = BASE_DIR / 'publisher/static/publisher/css/style.css' # Assuming CSS is in static
 
-# Email Settings (Example, configure as needed)
-# ... (email settings remain the same) ...
+# --- Google Cloud Storage Settings ---
+# These settings are used by the storages backend defined below
+GOOGLE_APPLICATION_CREDENTIALS = os.getenv('GOOGLE_APPLICATION_CREDENTIALS')
+GS_BUCKET_NAME = os.getenv('GS_BUCKET_NAME')
+GS_PROJECT_ID = os.getenv('GS_PROJECT_ID')
 
-# Security Settings (Adjust for production!)
-CSRF_COOKIE_SECURE = os.getenv('CSRF_COOKIE_SECURE', 'False') == 'True'
-SESSION_COOKIE_SECURE = os.getenv('SESSION_COOKIE_SECURE', 'False') == 'True'
-SECURE_SSL_REDIRECT = os.getenv('SECURE_SSL_REDIRECT', 'False') == 'True'
-# SECURE_HSTS_SECONDS = 31536000 # Example: Enable HSTS in production
-# SECURE_HSTS_INCLUDE_SUBDOMAINS = True
-# SECURE_HSTS_PRELOAD = True
+# Optional: Set default ACL for new objects if needed (e.g., 'publicRead')
+# GS_DEFAULT_ACL = 'projectPrivate' # Default is usually private
 
-# File Upload Settings (Example, configure as needed)
-MAX_UPLOAD_SIZE = int(os.getenv('MAX_UPLOAD_SIZE', 5242880))  # Default 5MB
-# ALLOWED_UPLOAD_EXTENSIONS are often better handled during form/serializer validation
+# --- Django Storages Configuration (Modern Method) ---
+STORAGES = {
+    "default": {
+        # Use the GCS backend for default file storage (media files)
+        "BACKEND": "storages.backends.gcloud.GoogleCloudStorage",
+        # The backend automatically picks up GOOGLE_APPLICATION_CREDENTIALS,
+        # GS_BUCKET_NAME, GS_PROJECT_ID, GS_DEFAULT_ACL etc. from settings.
+    },
+    "staticfiles": {
+        # Use Django's default static files storage for development.
+        # For production, you might use WhiteNoise or configure GCS here too.
+        "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+    },
+}
 
-# Logging Configuration
+# --- Validation for essential settings ---
+if not all([WECHAT_APP_ID, WECHAT_SECRET]):
+    logger_for_settings.warning("WeChat APP_ID or SECRET not configured in environment variables.")
+
+if not all([GS_BUCKET_NAME, GS_PROJECT_ID]):
+    logger_for_settings.warning("Google Cloud Storage settings (Bucket Name, Project ID) not fully configured in environment variables.")
+# Note: GOOGLE_APPLICATION_CREDENTIALS might not be a file path in all environments (e.g., Cloud Run).
+# This check is useful for local/VM setups using a key file.
+if GOOGLE_APPLICATION_CREDENTIALS and not Path(GOOGLE_APPLICATION_CREDENTIALS).is_file():
+     # Check if the path looks like it *should* be a file before warning
+     if "/" in GOOGLE_APPLICATION_CREDENTIALS or "\\" in GOOGLE_APPLICATION_CREDENTIALS:
+          logger_for_settings.warning(
+              f"Google Cloud Storage credentials file not found at the path specified by "
+              f"GOOGLE_APPLICATION_CREDENTIALS: {GOOGLE_APPLICATION_CREDENTIALS}"
+          )
+     # else: assume it might be non-file credentials (like workload identity)
+
+# --- Path to the CSS file for HTML previews ---
+PREVIEW_CSS_FILE_PATH = BASE_DIR / 'publisher/static/publisher/css/style.css'
+if not PREVIEW_CSS_FILE_PATH.is_file():
+    logger_for_settings.warning(f"Preview CSS file not found at expected location: {PREVIEW_CSS_FILE_PATH}")
+
+
+# Logging Configuration (ensure logs directory exists)
 LOGGING = {
     'version': 1,
-    'disable_existing_loggers': False,
+    'disable_existing_loggers': False, # Keep False for pytest caplog compatibility
     'formatters': {
         'verbose': {
-            'format': '{levelname} {asctime} {module}:{lineno} {process:d} {thread:d} {message}', # Added lineno
+            'format': '{levelname} {asctime} {module}:{lineno} {process:d} {thread:d} {message}',
             'style': '{',
         },
         'simple': {
@@ -183,52 +205,59 @@ LOGGING = {
         'console': {
             'class': 'logging.StreamHandler',
             'formatter': 'simple',
-            'level': 'DEBUG' if DEBUG else 'INFO', # Console level based on DEBUG
+            'level': 'DEBUG' if DEBUG else 'INFO',
         },
         'file': {
-            'level': 'INFO', # Log INFO and above to file
-            'class': 'logging.handlers.RotatingFileHandler', # Use rotating file handler
-            'filename': BASE_DIR / 'logs/django.log',
+            'level': 'INFO',
+            'class': 'logging.handlers.RotatingFileHandler',
+            'filename': LOG_DIR / 'django.log', # Use LOG_DIR
             'maxBytes': 1024*1024*5, # 5 MB
-            'backupCount': 5, # Keep 5 backup files
+            'backupCount': 5,
             'formatter': 'verbose',
         },
-        # Example: Handler for publisher app specifically
         'publisher_file': {
-             'level': 'DEBUG', # Log DEBUG and above for publisher app
+             'level': 'DEBUG',
              'class': 'logging.handlers.RotatingFileHandler',
-             'filename': BASE_DIR / 'logs/publisher.log',
+             'filename': LOG_DIR / 'publisher.log', # Use LOG_DIR
              'maxBytes': 1024*1024*5, # 5 MB
              'backupCount': 3,
              'formatter': 'verbose',
          },
     },
     'root': {
-        # Default handler if not specified by logger
         'handlers': ['console', 'file'],
-        'level': 'INFO', # Root level
+        'level': 'INFO',
     },
     'loggers': {
         'django': {
             'handlers': ['console', 'file'],
             'level': os.getenv('DJANGO_LOG_LEVEL', 'INFO'),
-            'propagate': False, # Don't pass to root logger
+            'propagate': False, # Avoid double logging with root logger
         },
-        'django.request': { # Capture request errors
-             'handlers': ['file'],
+         'django.request': { # Specific logger for request errors
+             'handlers': ['file'], # Log request errors to file
              'level': 'ERROR',
              'propagate': False,
          },
-        'publisher': { # Logger for your app
-            'handlers': ['console', 'publisher_file'], # Use specific handler
-            'level': 'DEBUG' if DEBUG else 'INFO', # Level based on DEBUG
-            'propagate': False, # Don't pass to root logger
+        'publisher': { # Logger for your app (views, services, models etc)
+            'handlers': ['console', 'publisher_file'],
+            'level': 'DEBUG' if DEBUG else 'INFO',
+            'propagate': False, # Avoid double logging with root
         },
-        # Add other third-party library loggers if needed
-         'publishing_engine': { # Example for the engine
-             'handlers': ['console', 'publisher_file'], # Log to same file as publisher
-             'level': 'INFO',
-             'propagate': False,
+        'publishing_engine': { # Logger for the engine sub-package
+             'handlers': ['console', 'publisher_file'],
+             'level': 'DEBUG' if DEBUG else 'INFO',
+             'propagate': False, # Avoid double logging with root
          },
+        'google.cloud': { # Logger for Google Cloud client libraries
+            'handlers': ['console', 'file'],
+            'level': 'INFO', # Adjust level as needed (e.g., WARNING in production)
+            'propagate': False,
+        },
+        'storages': { # Logger for django-storages itself
+             'handlers': ['console', 'file'],
+             'level': 'INFO', # Adjust level as needed
+             'propagate': False,
+        }
     },
 }
