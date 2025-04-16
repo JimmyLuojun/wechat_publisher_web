@@ -1,115 +1,256 @@
-# publisher/tests/conftest.py
+# tests/conftest.py
 
 import pytest
-import uuid
+from unittest.mock import patch, MagicMock, PropertyMock
 from pathlib import Path
+import uuid
+import logging # Added for side_effect logging
+
 from django.core.files.uploadedfile import SimpleUploadedFile
-from django.utils import timezone
+from django.conf import settings
+from django.core.cache import cache
 
-# Import the real model
-# *** FIX: Remove incorrect PublishingJobStatus import ***
-from publisher.models import PublishingJob
+# --- Mock WeChat API Error ---
+# Define a simple exception class to simulate WeChat API errors with errcode
+class MockWeChatAPIError(Exception):
+    """Custom exception to simulate WeChat API errors in tests."""
+    def __init__(self, message="Mock WeChat API Error", errcode=None, errmsg=None):
+        super().__init__(message)
+        self.errcode = errcode
+        self.errmsg = errmsg or message
 
-# --- Minimal valid image data (1x1 transparent GIF) ---
-VALID_IMAGE_BYTES = b'GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
-# --- Minimal valid CSS data ---
-VALID_CSS_BYTES = b'body { color: #333; }'
+# --- Fixtures ---
+
+@pytest.fixture(autouse=True)
+def setup_django_settings(settings, tmp_path):
+    """
+    Automatically configure Django settings for each test.
+    - Uses pytest's tmp_path for MEDIA_ROOT to isolate test file artifacts.
+    - Configures a unique in-memory cache (LocMemCache) for test isolation.
+    - Sets dummy WeChat credentials required by the services.
+    """
+    settings.MEDIA_ROOT = tmp_path / "media"
+    settings.MEDIA_URL = "/media/"
+    settings.PREVIEW_CSS_FILE_PATH = None
+    settings.CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': f'wechat-test-cache-{uuid.uuid4()}',
+        }
+    }
+    settings.WECHAT_PERMANENT_MEDIA_CACHE_TIMEOUT = None
+    settings.WECHAT_APP_ID = "test_app_id"
+    settings.WECHAT_SECRET = "test_secret"
+    settings.WECHAT_BASE_URL = "https://api.example.com" # Mock base URL
+    settings.WECHAT_DRAFT_PLACEHOLDER_CONTENT = "<p>Test Placeholder Content</p>"
+    Path(settings.MEDIA_ROOT).mkdir(parents=True, exist_ok=True)
+
+@pytest.fixture(autouse=True)
+def clear_cache_before_test():
+    """
+    Ensures the Django cache is explicitly cleared before each test runs.
+    """
+    cache.clear()
+
+@pytest.fixture
+def mock_wechat_api():
+    """
+    Mocks the publishing_engine.wechat.api module as used within publisher.services.
+    Provides MagicMock objects for API functions with default return values.
+    """
+    with patch("publisher.services.wechat_api", autospec=True) as mock_api:
+        mock_api.upload_thumb_media.return_value = "mock_thumb_media_id_from_upload"
+        mock_api.upload_content_image.return_value = "http://mock.url/content_image.jpg"
+        mock_api.add_draft.return_value = "mock_draft_media_id_success"
+        yield mock_api
+
+@pytest.fixture
+def mock_wechat_auth():
+    """
+    Mocks the get_access_token function as used within publisher.services.
+    """
+    with patch("publisher.services.auth.get_access_token", autospec=True) as mock_auth:
+        mock_auth.return_value = "mock_access_token_xyz" # Provide a mock token
+        yield mock_auth
+
+@pytest.fixture
+def mock_metadata_reader():
+    """
+    Mocks the publishing_engine.core.metadata_reader module as used within publisher.services.
+    Provides default return values for metadata extraction.
+    """
+    with patch("publisher.services.metadata_reader", autospec=True) as mock_reader:
+        mock_reader.extract_metadata_and_content.return_value = (
+            {"title": "Mock Title", "author": "Test Author"}, # metadata_dict
+            "## Mock Markdown Body\n\nThis is mock content with ![Image](content_fixture.png)." # markdown_body_content (ensure it has an image reference for the processor mock)
+        )
+        yield mock_reader
+
+# !!!!!!!!!! START OF CORRECTION !!!!!!!!!!
+@pytest.fixture
+def mock_html_processor(dummy_content_image_file): # Inject the dummy file fixture
+    """
+    Mocks the publishing_engine.core.html_processor module as used within publisher.services.
+    Simulates calling the image_uploader callback.
+    """
+    logger = logging.getLogger("mock_html_processor_fixture")
+
+    def process_html_side_effect(md_content, css_path, markdown_file_path, image_uploader):
+        """
+        This side effect function simulates the real process_html_content:
+        1. It takes the arguments the real function would.
+        2. It calls the image_uploader callback function passed to it.
+        3. It returns a dummy HTML fragment.
+        """
+        logger.info("Mock process_html_content called.")
+        # Simulate finding an image and needing to upload it.
+        # We need a valid Path object for the image_uploader callback.
+        # Let's create a dummy file path based on the injected fixture.
+        # Note: The real processor would resolve paths relative to markdown_file_path.
+        # For simplicity, we use the path from the fixture, assuming it represents
+        # an image linked in the markdown. Ensure the callback can handle this path.
+
+        # Create the dummy content image file physically in the temp dir if needed by callback
+        # Or ensure the path passed to callback exists. Let's assume the callback
+        # needs an existing file path. We can use the path from the fixture
+        # if the fixture creates the file, or create one here.
+
+        # Simplest approach: Assume the callback needs *a* Path object.
+        # Let's construct a plausible path relative to the test's MEDIA_ROOT.
+        # We need to ensure this path exists for the callback's hashing/upload logic.
+        # The dummy_content_image_file fixture creates a file in tmp_path.
+        # Let's find its absolute path within the test's MEDIA_ROOT.
+        # We need the actual path where _save_uploaded_file_locally would save it.
+        # This is getting complex. Let's simplify:
+        # Assume the callback is robust enough to handle a Path object.
+        # We'll just call it with a dummy path *name* relative to the markdown.
+        # The callback in services.py actually resolves the path, so it needs to exist.
+
+        # Let's try calling the callback with the *absolute* path of the dummy file fixture.
+        # This assumes the fixture provides a file object with a resolvable path.
+        try:
+            # Create the dummy file in the expected location for the callback to find
+            # The callback resolves relative to the *markdown file path* if relative.
+            # Let's assume markdown_file_path is the parent of where content images are.
+            # md_path = Path(markdown_file_path) # services.py passes this
+            # dummy_image_name = "content_fixture.png" # From dummy markdown
+            # dummy_image_path_for_callback = md_path.parent / dummy_image_name
+            # dummy_image_path_for_callback.write_bytes(dummy_content_image_file.read())
+            # dummy_content_image_file.seek(0)
+
+            # ---- Simplified Approach: Create file in known test location ----
+            # The callback in services.py will try to resolve it. Let's make it easy.
+            # Assume the callback looks relative to the MD file's parent.
+            # The MD file is saved in MEDIA_ROOT / 'uploads/markdown'
+            # The content images are saved in MEDIA_ROOT / 'uploads/content_images'
+            # Let's assume the markdown refers to "../content_images/content_fixture.png"
+            # This is tricky because the mock doesn't know the *exact* path structure.
+
+            # --- Easiest Mocking: Call with a path we know exists ---
+            # The callback itself will save content images via _save_uploaded_file_locally
+            # Let's find one of those saved files if possible, or just use the fixture path.
+            # The fixture `dummy_content_image_file` provides a SimpleUploadedFile.
+            # Its 'name' attribute might be just the filename.
+            # Let's write it to a predictable place for the callback.
+            content_img_dir = Path(settings.MEDIA_ROOT) / "uploads/content_images"
+            content_img_dir.mkdir(parents=True, exist_ok=True)
+            saved_content_image_path = content_img_dir / dummy_content_image_file.name
+            saved_content_image_path.write_bytes(dummy_content_image_file.read())
+            dummy_content_image_file.seek(0)
+
+            logger.info(f"Mock simulating image found, calling image_uploader callback with path: {saved_content_image_path}")
+            # Call the provided callback
+            uploaded_url = image_uploader(saved_content_image_path)
+            logger.info(f"Mock received URL from callback: {uploaded_url}")
+
+        except Exception as e:
+            logger.error(f"Error in mock_html_processor side_effect trying to call callback: {e}", exc_info=True)
+            # Don't raise here, just log, so the test can proceed and potentially fail elsewhere if needed
+
+        # Return the standard dummy HTML fragment
+        return "<p>Mock Processed HTML Fragment with Image</p>"
+
+    # Patch where html_processor is looked up
+    with patch("publisher.services.html_processor", autospec=True) as mock_processor:
+        # Set the side_effect
+        mock_processor.process_html_content.side_effect = process_html_side_effect
+        yield mock_processor
+
+# !!!!!!!!!! END OF CORRECTION !!!!!!!!!!
+
+@pytest.fixture
+def mock_payload_builder():
+    """
+    Mocks the publishing_engine.core.payload_builder module as used within publisher.services.
+    Provides a default return value for payload building.
+    """
+    with patch("publisher.services.payload_builder", autospec=True) as mock_builder:
+        # Return a dictionary simulating the structure expected by wechat_api.add_draft
+        mock_builder.build_draft_payload.return_value = {
+            "title": "Mock Built Title",
+            "content": "<p>Test Placeholder Content</p>", # Match setting
+            "thumb_media_id": "mock_built_thumb_id",
+            "author": "Mock Built Author", # Add fields matching real function if needed
+            # Add other fields returned by your actual builder if needed by tests
+        }
+        yield mock_builder
 
 
 @pytest.fixture
-def sample_md_content_with_image():
-    """Provides sample Markdown content string with metadata and an image link."""
-    return """---
-title: Sample Test Article
-author: Pytest Fixture
-tags: [test, fixture]
+def dummy_markdown_file(tmp_path):
+    """Creates a dummy markdown file in the temp directory for testing uploads."""
+    content = """---
+title: Test Article Title Fixture
+author: Pytest Fixture Author
+tags: [fixture, markdown]
 ---
 
-# Main Content
+# Fixture Heading
 
-This is a paragraph.
+Content generated by fixture.
 
-![Sample Image Alt Text](images/sample_content.gif)
-
-Another paragraph.
-"""
-
-@pytest.fixture
-def sample_markdown_file(sample_md_content_with_image):
-    """Provides a sample Markdown UploadedFile object."""
+![Fixture Image](content_fixture.png)
+""" # Ensure this matches the image name used in mock_html_processor side_effect if needed
+    file_path = tmp_path / "test_article_fixture.md"
+    file_path.write_text(content, encoding='utf-8')
     return SimpleUploadedFile(
-        "article.md",
-        sample_md_content_with_image.encode('utf-8'),
+        name=file_path.name,
+        content=file_path.read_bytes(),
         content_type="text/markdown"
     )
 
 @pytest.fixture
-def sample_cover_image_file():
-    """Provides a sample cover image UploadedFile object."""
+def dummy_cover_image_file(tmp_path):
+    """Creates a dummy JPEG image file in the temp directory for testing uploads."""
+    file_path = tmp_path / "cover_fixture.jpg"
+    file_path.write_bytes(b"\xFF\xD8\xFF\xE0 dummy jpeg cover fixture data")
     return SimpleUploadedFile(
-        "cover.gif",
-        VALID_IMAGE_BYTES,
-        content_type="image/gif"
+        name=file_path.name,
+        content=file_path.read_bytes(),
+        content_type="image/jpeg"
     )
 
 @pytest.fixture
-def sample_content_image_file():
-    """Provides a sample content image UploadedFile object."""
-    # Match the filename used in sample_md_content_with_image
+def dummy_content_image_file(tmp_path):
+    """Creates a dummy PNG image file in the temp directory for testing uploads."""
+    # Use a consistent name that might be referenced in markdown/side_effect
+    file_name = "content_fixture.png"
+    file_path = tmp_path / file_name
+    file_path.write_bytes(b"\x89PNG\r\n\x1a\n dummy png content fixture data")
     return SimpleUploadedFile(
-        "sample_content.gif",
-        VALID_IMAGE_BYTES,
-        content_type="image/gif"
+        name=file_name, # Return consistent name
+        content=file_path.read_bytes(),
+        content_type="image/png"
     )
 
 @pytest.fixture
-def sample_css_file():
-    """Provides a sample CSS UploadedFile object (though not directly uploaded in services)."""
-    return SimpleUploadedFile(
-        "style.css",
-        VALID_CSS_BYTES,
-        content_type="text/css"
-    )
+def dummy_content_image_files(dummy_content_image_file):
+    """Provides a list containing one dummy content image file fixture."""
+    return [dummy_content_image_file]
 
-
+# --- Fixture to Provide Mock Error Class ---
 @pytest.fixture
-def preview_ready_job_in_db(db, settings, tmp_path):
-    """
-    Creates a PublishingJob instance in PREVIEW_READY state directly in the test DB.
-    Also creates the corresponding dummy local cover file needed for retry tests.
-    Requires pytest-django's `db` fixture. Tests using this MUST be marked
-    with `@pytest.mark.django_db`.
-
-    Args:
-        db: pytest-django fixture for database access.
-        settings: Django settings fixture.
-        tmp_path: Pytest fixture for a temporary directory.
-
-    Returns:
-        PublishingJob: The persisted job instance.
-    """
-    # Configure MEDIA_ROOT to use tmp_path for this fixture's file creation
-    settings.MEDIA_ROOT = str(tmp_path) # Ensure it's a string for Path() compatibility
-
-    # Define relative path for the dummy cover file *within* MEDIA_ROOT
-    local_cover_rel_path_str = 'uploads/cover_images/cover_for_retry_fixture.gif'
-    # Create the absolute path within the temporary MEDIA_ROOT
-    local_cover_abs_path = tmp_path / local_cover_rel_path_str
-    # Ensure parent directory exists
-    local_cover_abs_path.parent.mkdir(parents=True, exist_ok=True)
-    # Create the dummy file (content doesn't matter for existence check in retry)
-    local_cover_abs_path.write_bytes(VALID_IMAGE_BYTES) # Write valid bytes just in case
-
-    # Create the job instance in the database
-    # *** FIX: Use PublishingJob.Status for the status choice ***
-    job = PublishingJob.objects.create(
-        task_id=uuid.uuid4(),
-        status=PublishingJob.Status.PREVIEW_READY, # Use the nested Status class
-        metadata={'title': 'DB Fixture Article', 'author': 'Conftest'},
-        thumb_media_id='fixture_thumb_id_from_db_123',
-        # Store the RELATIVE path string in the model field
-        original_cover_image_path=local_cover_rel_path_str,
-        original_markdown_path='uploads/markdown/dummy_fixture.md', # Add dummy path
-        preview_html_path='previews/dummy_fixture.html', # Add dummy path
-    )
-    return job
+def mock_wechat_api_error_cls():
+    """Provides the MockWeChatAPIError class via a fixture, avoiding direct imports in tests."""
+    return MockWeChatAPIError
+# --- End Fixture ---

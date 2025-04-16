@@ -165,4 +165,4 @@ dmypy.json
 .pytype/
 
 # Cython debug symbols
-cython_debug/
+cython_debug/secrets/wechat-publisher-web-00f2d149a4d0.json

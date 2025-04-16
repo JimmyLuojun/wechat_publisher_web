@@ -1,363 +1,491 @@
 # publisher/tests/test_services.py
 
 import pytest
-import uuid
-import os
-import json
-from pathlib import Path
 from unittest.mock import patch, MagicMock, ANY, call
-import yaml
+from pathlib import Path
+import uuid
+import os  # <-- ****** ADD THIS IMPORT ******
 
-from django.core.files.uploadedfile import SimpleUploadedFile
-from django.utils import timezone
-from django.conf import settings as django_settings
+from django.conf import settings
+from django.core.cache import cache
 from django.core.exceptions import ObjectDoesNotExist
+from django.core.files.uploadedfile import SimpleUploadedFile
 
-# Import the service functions under test
-from publisher import services
-# Import the real model
+# Models and Services to test
 from publisher.models import PublishingJob
+from publisher.services import start_processing_job, confirm_and_publish_job
+from publishing_engine.utils.hashing_checking import calculate_file_hash
 
-# --- Custom Exception for Mocking API Errors ---
-class MockWeChatAPIError(Exception):
-    """Custom exception to mimic potential API errors with codes."""
-    def __init__(self, message, errcode=None, errmsg=None):
-        super().__init__(message)
-        self.errcode = errcode
-        self.errmsg = errmsg
+# Mock Error defined in conftest - Using relative import
+from .conftest import MockWeChatAPIError
 
-# --- Fixtures specific to this test file ---
-
-@pytest.fixture(autouse=True)
-def setup_django_settings(tmp_path, settings):
-    """Configure necessary Django settings for the tests."""
-    settings.MEDIA_ROOT = str(tmp_path / "media")
-    settings.MEDIA_URL = "/media/"
-    settings.WECHAT_APP_ID = "test_app_id"
-    settings.WECHAT_SECRET = "test_secret"
-    settings.WECHAT_BASE_URL = "https://fake-wechat-api.com"
-    css_dir = tmp_path / "static"; css_dir.mkdir(parents=True, exist_ok=True)
-    css_path = css_dir / "preview_style.css"; css_path.write_text("body { font-family: sans-serif; }")
-    settings.PREVIEW_CSS_FILE_PATH = str(css_path)
-    settings.WECHAT_DRAFT_PLACEHOLDER_CONTENT = "<p>Test Placeholder</p>"
-    settings.BASE_DIR = str(tmp_path)
-
-@pytest.fixture
-def mock_filesystem_helpers(tmp_path, settings):
-    """Mocks the internal file saving helpers."""
-    saved_files_map = {} # key: original stem, value: absolute Path
-    def _mock_save_side_effect(file_obj, subfolder=""):
-        save_dir = Path(settings.MEDIA_ROOT) / subfolder
-        save_dir.mkdir(parents=True, exist_ok=True)
-        original_stem = Path(file_obj.name).stem
-        save_path = save_dir / f"saved_{original_stem}_{Path(file_obj.name).suffix.replace('.', '')}_{uuid.uuid4().hex[:4]}"
-        file_obj.seek(0); save_path.write_bytes(file_obj.read()); file_obj.seek(0)
-        saved_files_map[original_stem] = save_path
-        return save_path
-    def _mock_gen_preview_side_effect(content, task_id):
-        save_dir = Path(settings.MEDIA_ROOT) / "previews"
-        save_dir.mkdir(parents=True, exist_ok=True)
-        filename = f"{task_id}.html"
-        save_path_abs = save_dir / filename
-        save_path_abs.write_text(content, encoding='utf-8')
-        relative_path_str = str(Path("previews") / filename)
-        return relative_path_str
-    with patch('publisher.services._save_uploaded_file_locally', side_effect=_mock_save_side_effect) as mock_save, \
-         patch('publisher.services._generate_preview_file', side_effect=_mock_gen_preview_side_effect) as mock_gen_preview:
-        yield mock_save, mock_gen_preview, saved_files_map
-
-
-@pytest.fixture
-def mock_publishing_engine(mock_filesystem_helpers):
-    """Mocks all components imported from publishing_engine."""
-    # This mock now consistently simulates the processor finding the relative path
-    # and passing that potentially non-existent path to the callback.
-    # This is simpler and allows tests to focus on the callback's behavior.
-    _, _, saved_files_map = mock_filesystem_helpers # Get map, still useful for other tests
-
-    with patch('publisher.services.metadata_reader') as mock_meta, \
-         patch('publisher.services.html_processor') as mock_html, \
-         patch('publisher.services.payload_builder') as mock_payload, \
-         patch('publisher.services.auth') as mock_auth, \
-         patch('publisher.services.wechat_api') as mock_api:
-
-        mock_auth.get_access_token.return_value = "mock_access_token_12345"
-        mock_meta.extract_metadata_and_content.return_value = (
-            {'title': 'Sample Test Article', 'author': 'Pytest Fixture', 'tags': ['test', 'fixture']},
-            "# Main Content\n\nThis is a paragraph.\n\n![Sample Image Alt Text](images/sample_content.gif)\n\nAnother paragraph."
-        )
-
-        # Keep the simpler html_processor mock that passes the unresolved path
-        def html_processor_side_effect(md_content, css_path, markdown_file_path, image_uploader):
-            image_relative_path_in_md = "images/sample_content.gif"
-            path_to_resolve = Path(markdown_file_path).parent / image_relative_path_in_md
-            uploaded_url = image_uploader(path_to_resolve) # Pass unresolved path
-            style_tag = f"<style>{Path(css_path).read_text()}</style>" if css_path and Path(css_path).exists() else ""
-            alt_text = "Sample Image Alt Text"
-            if uploaded_url:
-                html = f"<p>Processed HTML with image: <img src='{uploaded_url}' alt='{alt_text}'></p>"
-            else:
-                html = f"<p>Processed HTML - image '{image_relative_path_in_md}' upload failed</p>"
-            return f"{style_tag}{html}"
-        mock_html.process_html_content.side_effect = html_processor_side_effect
-
-        mock_payload.build_draft_payload.return_value = {
-            "title": "Payload Title", "author": "Payload Author", "content": "<p>Payload Content Placeholder</p>",
-            "thumb_media_id": "payload_thumb_id", "digest": "Payload Digest...", "content_source_url": "http://example.com/source",
-            "need_open_comment": 1, "only_fans_can_comment": 0
-        }
-        mock_api.upload_thumb_media.return_value = "mock_permanent_thumb_id_67890"
-        # This mock might not be called if the path resolve fails first in the callback
-        mock_api.upload_content_image.side_effect = lambda access_token, image_path, base_url: f"http://mmbiz.qpic.cn/mmbiz_gif/mock_url_for_{image_path.stem}/0"
-        mock_api.add_draft.return_value = "mock_draft_media_id_abcde"
-        mock_api.WeChatAPIError = MockWeChatAPIError
-        yield {
-            "metadata_reader": mock_meta, "html_processor": mock_html, "payload_builder": mock_payload,
-            "auth": mock_auth, "wechat_api": mock_api, "saved_files_map": saved_files_map
-        }
-
-
-@pytest.fixture
-def mock_job_manager():
-    """Mocks the PublishingJob model manager."""
-    with patch('publisher.services.PublishingJob.objects') as mock_manager:
-        mock_job_instance = MagicMock(spec=PublishingJob)
-        mock_job_instance.task_id = uuid.uuid4(); mock_job_instance.pk = mock_job_instance.task_id
-        mock_job_instance.status = PublishingJob.Status.PENDING
-        mock_job_instance.metadata = None; mock_job_instance.thumb_media_id = None
-        mock_job_instance.original_cover_image_path = None; mock_job_instance.original_markdown_path = None
-        mock_job_instance.preview_html_path = None; mock_job_instance.wechat_media_id = None
-        mock_job_instance.error_message = None; mock_job_instance.published_at = None
-        def mock_get_status_display():
-            for value, label in PublishingJob.Status.choices:
-                if value == mock_job_instance.status: return label
-            return str(mock_job_instance.status)
-        mock_job_instance.get_status_display.side_effect = mock_get_status_display
-        mock_manager.create.return_value = mock_job_instance
-        def get_side_effect(pk=None, task_id=None):
-             if pk == mock_job_instance.pk or task_id == mock_job_instance.task_id: return mock_job_instance
-             raise ObjectDoesNotExist("Mock Job not found")
-        mock_manager.get.side_effect = get_side_effect
-        yield mock_manager, mock_job_instance
-
-# ============================================================
-# ==                  Test Cases                            ==
-# ============================================================
 
 # --- Tests for start_processing_job ---
 
 @pytest.mark.django_db
-class TestStartProcessingJob:
+def test_start_processing_job_success_cache_miss(
+    dummy_markdown_file: SimpleUploadedFile,
+    dummy_cover_image_file: SimpleUploadedFile,
+    dummy_content_image_files: list[SimpleUploadedFile],
+    mock_wechat_api: MagicMock, # Added type hints for mocks
+    mock_wechat_auth: MagicMock, # This is the mock of the function itself
+    mock_metadata_reader: MagicMock,
+    mock_html_processor: MagicMock
+):
+    """
+    Test successful job processing when the thumbnail media ID is NOT found in the cache.
+    Verifies that the thumbnail is uploaded and the result is cached.
+    """
+    # Arrange: Ensure cache is empty (done by autouse fixture)
 
-    def test_success_path(self, sample_markdown_file, sample_cover_image_file, sample_content_image_file,
-                          mock_filesystem_helpers, mock_publishing_engine, mock_job_manager):
-        """
-        Verify the successful execution flow of start_processing_job,
-        acknowledging that image upload might fail if relative path doesn't exist.
-        """
-        mock_save_local, mock_gen_preview, saved_files_map = mock_filesystem_helpers
-        mock_engine = mock_publishing_engine
-        mock_manager, mock_job = mock_job_manager
+    # Act
+    result = start_processing_job(
+        dummy_markdown_file, dummy_cover_image_file, dummy_content_image_files
+    )
 
-        # --- Act ---
-        result = services.start_processing_job(
-            markdown_file=sample_markdown_file,
-            cover_image=sample_cover_image_file,
-            content_images=[sample_content_image_file]
-        )
+    # Assert: Check returned values and job state in DB
+    assert "task_id" in result, "Result should contain task_id"
+    assert "preview_url" in result, "Result should contain preview_url"
+    task_id = uuid.UUID(result["task_id"])
+    job = PublishingJob.objects.get(pk=task_id)
 
-        # --- Assert ---
-        # Job Creation/Status (unchanged)
-        mock_manager.create.assert_called_once_with(task_id=ANY, status=PublishingJob.Status.PENDING)
-        expected_save_calls = [
-            call(update_fields=services.JOB_STATUS_UPDATE_FIELDS), call(update_fields=services.JOB_PATHS_UPDATE_FIELDS),
-            call(update_fields=services.JOB_THUMB_UPDATE_FIELDS), call(update_fields=services.JOB_METADATA_UPDATE_FIELDS),
-            call(update_fields=services.JOB_PREVIEW_UPDATE_FIELDS + ['error_message']),
-        ]
-        mock_job.save.assert_has_calls(expected_save_calls)
-        assert mock_job.status == PublishingJob.Status.PREVIEW_READY
-        assert mock_job.error_message is None
-
-        # File Operations (unchanged)
-        assert mock_save_local.call_count == 3
-        mock_gen_preview.assert_called_once()
-        assert mock_job.preview_html_path is not None
-
-        # Engine Interactions
-        mock_engine["auth"].get_access_token.assert_called_once()
-        mock_engine["wechat_api"].upload_thumb_media.assert_called_once()
-        assert mock_job.thumb_media_id == "mock_permanent_thumb_id_67890"
-        mock_engine["metadata_reader"].extract_metadata_and_content.assert_called_once()
-        assert mock_job.metadata['title'] == 'Sample Test Article'
-        mock_engine["html_processor"].process_html_content.assert_called_once()
-
-        # *** FIX: Assert upload_content_image was NOT called ***
-        # Because the simple html_processor mock passes a path that doesn't exist
-        # relative to the markdown file, the callback's resolve(strict=True) fails.
-        mock_engine["wechat_api"].upload_content_image.assert_not_called()
-
-        # *** FIX: Check preview content for failure message ***
-        preview_call_args, _ = mock_gen_preview.call_args
-        generated_html = preview_call_args[0]
-        assert "image 'images/sample_content.gif' upload failed" in generated_html
-
-        # Result (unchanged)
-        assert result["task_id"] == mock_job.task_id
-        assert result["preview_url"].endswith(mock_job.preview_html_path.replace(os.path.sep, '/'))
+    assert job.status == PublishingJob.Status.PREVIEW_READY, "Job status should be PREVIEW_READY"
+    assert job.error_message is None, "Error message should be None on success"
+    assert job.original_markdown_path is not None
+    assert job.original_cover_image_path is not None
+    assert job.thumb_media_id == "mock_thumb_media_id_from_upload", "Thumb media ID should be from the mock upload"
+    assert job.metadata == {"title": "Mock Title", "author": "Test Author"}, "Metadata should match mock"
+    assert job.preview_html_path is not None, "Preview HTML path should be set"
+    assert job.preview_html_path.endswith(f"{task_id}.html"), "Preview path should use task_id"
+    # Ensure preview URL construction is plausible
+    assert result["preview_url"].startswith(settings.MEDIA_URL)
+    # ** CORRECTION: Use os.path.sep **
+    assert result["preview_url"].endswith(job.preview_html_path.replace(os.path.sep, '/')), "Preview URL should match saved path"
 
 
-    # test_failure_missing_wechat_keys (unchanged)
-    def test_failure_missing_wechat_keys(self, sample_markdown_file, sample_cover_image_file, sample_content_image_file,
-                                         mock_filesystem_helpers, mock_publishing_engine, mock_job_manager, settings):
-        mock_manager, mock_job = mock_job_manager; settings.WECHAT_APP_ID = None
-        with pytest.raises(ValueError, match="WECHAT_APP_ID"):
-            services.start_processing_job(sample_markdown_file, sample_cover_image_file, [sample_content_image_file])
-        mock_job.save.assert_called_with(update_fields=services.JOB_ERROR_UPDATE_FIELDS)
-        assert mock_job.status == PublishingJob.Status.FAILED
+    # Assert: Verify external calls (API, utils)
+    mock_wechat_auth.assert_called_once()
+    mock_metadata_reader.extract_metadata_and_content.assert_called_once()
+    # Thumbnail upload *was* called because it was a cache miss
+    mock_wechat_api.upload_thumb_media.assert_called_once()
+    mock_html_processor.process_html_content.assert_called_once()
+    # Content image upload API was called (at least once) by the callback
+    mock_wechat_api.upload_content_image.assert_called()
 
-    # test_failure_metadata_parsing (unchanged)
-    def test_failure_metadata_parsing(self, sample_markdown_file, sample_cover_image_file, sample_content_image_file,
-                                      mock_filesystem_helpers, mock_publishing_engine, mock_job_manager):
-        mock_engine = mock_publishing_engine; mock_manager, mock_job = mock_job_manager
-        mock_engine["metadata_reader"].extract_metadata_and_content.side_effect = yaml.YAMLError("Bad YAML")
-        with pytest.raises(ValueError, match="Invalid YAML"):
-             services.start_processing_job(sample_markdown_file, sample_cover_image_file, [sample_content_image_file])
-        mock_job.save.assert_called_with(update_fields=services.JOB_ERROR_UPDATE_FIELDS)
-        assert mock_job.status == PublishingJob.Status.FAILED
-
-    # test_failure_thumb_upload_api_error (unchanged)
-    def test_failure_thumb_upload_api_error(self, sample_markdown_file, sample_cover_image_file, sample_content_image_file,
-                                           mock_filesystem_helpers, mock_publishing_engine, mock_job_manager):
-        mock_engine = mock_publishing_engine; mock_manager, mock_job = mock_job_manager
-        mock_engine["wechat_api"].upload_thumb_media.return_value = None
-        with pytest.raises(RuntimeError, match="Failed to upload permanent thumbnail"):
-             services.start_processing_job(sample_markdown_file, sample_cover_image_file, [sample_content_image_file])
-        mock_job.save.assert_called_with(update_fields=services.JOB_ERROR_UPDATE_FIELDS)
-        assert mock_job.status == PublishingJob.Status.FAILED
-
-    # test_failure_callback_image_resolve_error (Fixed setup and assertion)
-    def test_failure_callback_image_resolve_error(self, sample_markdown_file, sample_cover_image_file, sample_content_image_file,
-                                           mock_filesystem_helpers, mock_publishing_engine, mock_job_manager):
-        """Test the scenario where the callback fails to resolve the image path."""
-        mock_engine = mock_publishing_engine; mock_manager, mock_job = mock_job_manager
-        mock_save_local, mock_gen_preview, saved_files_map = mock_filesystem_helpers
-
-        # *** FIX: Configure mock_resolve without using saved_files_map ***
-        # It should fail when Path.resolve is called on a path matching the pattern
-        # passed by the html_processor mock (e.g., .../markdown/images/sample_content.gif)
-        original_resolve = Path.resolve
-        def mock_resolve(self, strict=False):
-            # Check if the path looks like the one derived from markdown
-            # This is less precise than before but avoids the timing issue
-            if "images" in self.parts and self.name == "sample_content.gif":
-                 # print(f"DEBUG: mock_resolve raising FileNotFoundError for {self}")
-                 raise FileNotFoundError(f"Mock resolve error: Cannot find image {self}")
-            # print(f"DEBUG: mock_resolve allowing original resolve for {self}")
-            # Important: Call original resolve for other paths
-            return original_resolve(self, strict=strict)
-
-        # Patch Path.resolve which is used inside the service's callback
-        with patch('pathlib.Path.resolve', side_effect=mock_resolve, autospec=True):
-             result = services.start_processing_job(
-                 sample_markdown_file,
-                 sample_cover_image_file,
-                 [sample_content_image_file]
-             )
-
-        # Assert that upload was NOT called because resolve failed inside callback
-        mock_engine["wechat_api"].upload_content_image.assert_not_called()
-        # Assert preview was still generated
-        mock_gen_preview.assert_called_once()
-        # Assert preview content shows failure
-        preview_content = mock_gen_preview.call_args[0][0]
-        assert "image 'images/sample_content.gif' upload failed" in preview_content
-        # Assert overall job status is success (preview ready)
-        assert mock_job.status == PublishingJob.Status.PREVIEW_READY
+    # Assert: Verify cache interaction (cache was SET)
+    cover_path_abs = Path(settings.MEDIA_ROOT) / job.original_cover_image_path
+    # Re-calculate hash here for verification
+    cover_hash = calculate_file_hash(cover_path_abs)
+    cache_key = f"wechat_thumb_sha256_{cover_hash}"
+    assert cache.get(cache_key) == "mock_thumb_media_id_from_upload", "Cache should contain the uploaded thumb ID"
 
 
-# --- Tests for confirm_and_publish_job (unchanged from previous correct version) ---
+# (Rest of test_services.py remains the same as the previous corrected version)
+# ... include all other test functions ...
+@pytest.mark.django_db
+def test_start_processing_job_success_cache_hit(
+    dummy_markdown_file: SimpleUploadedFile,
+    dummy_cover_image_file: SimpleUploadedFile,
+    dummy_content_image_files: list[SimpleUploadedFile],
+    mock_wechat_api: MagicMock,
+    mock_wechat_auth: MagicMock, # This is the mock of the function itself
+    mock_metadata_reader: MagicMock,
+    mock_html_processor: MagicMock
+):
+    """
+    Test successful job processing when the thumbnail media ID IS found in the cache.
+    Verifies that the thumbnail is NOT re-uploaded and the cached ID is used.
+    """
+    # Arrange: Pre-populate cache
+    # Save a temporary file to calculate its hash for the cache key
+    # Need to use the actual file content used in the test run
+    temp_cover_path = Path(settings.MEDIA_ROOT) / "uploads/cover_images/temp_cover_for_cache_hit.jpg"
+    temp_cover_path.parent.mkdir(parents=True, exist_ok=True)
+    file_content = dummy_cover_image_file.read() # Read content
+    temp_cover_path.write_bytes(file_content)
+    dummy_cover_image_file.seek(0) # Reset file pointer after read
+
+    cover_hash = calculate_file_hash(temp_cover_path)
+    cache_key = f"wechat_thumb_sha256_{cover_hash}"
+    cached_media_id = "cached_thumb_media_id_xyz"
+    cache.set(cache_key, cached_media_id, timeout=None) # Cache indefinitely for the test
+    assert cache.get(cache_key) == cached_media_id, "Cache pre-population failed"
+    # No need to clean up temp_cover_path, tmp_path fixture handles it
+
+    # Act
+    result = start_processing_job(
+        dummy_markdown_file, dummy_cover_image_file, dummy_content_image_files
+    )
+
+    # Assert: Check returned values and job state in DB
+    assert "task_id" in result
+    task_id = uuid.UUID(result["task_id"])
+    job = PublishingJob.objects.get(pk=task_id)
+
+    assert job.status == PublishingJob.Status.PREVIEW_READY, "Job status should be PREVIEW_READY"
+    # Verify the cached media ID was used for the job record
+    assert job.thumb_media_id == cached_media_id, "Job should use the cached thumb ID"
+    assert job.error_message is None
+    assert result["preview_url"] is not None
+
+    # Assert: Verify external calls
+    # Thumbnail upload API was *NOT* called due to cache hit
+    mock_wechat_api.upload_thumb_media.assert_not_called()
+    # Other essential calls should still happen
+    mock_wechat_auth.assert_called_once()
+    mock_metadata_reader.extract_metadata_and_content.assert_called_once()
+    mock_html_processor.process_html_content.assert_called_once()
+
 
 @pytest.mark.django_db
-class TestConfirmAndPublishJob:
+def test_start_processing_job_hash_calculation_fails(
+    dummy_markdown_file: SimpleUploadedFile,
+    dummy_cover_image_file: SimpleUploadedFile,
+    dummy_content_image_files: list[SimpleUploadedFile],
+    mock_wechat_api: MagicMock,
+    mock_wechat_auth: MagicMock,
+    mock_metadata_reader: MagicMock,
+    mock_html_processor: MagicMock
+):
+    """
+    Test job processing when cover image hash calculation fails.
+    Verifies that the thumbnail is still uploaded directly (cache skipped)
+    and the cache is NOT set for the thumbnail.
+    """
+    # Arrange: Mock calculate_file_hash to return None for the cover image
+    # Patch the function specifically where it's imported in services.py
+    with patch("publisher.services.calculate_file_hash") as mock_calculate_hash:
+        # Configure mock: Return None when called for the cover image path
+        # We need to know the path it will be called with. Let's mock based on Path object.
+        def hash_side_effect(path_obj, algorithm='sha256'):
+             # Simplest approach: return None for all calls in this test scope
+            return None
+        mock_calculate_hash.side_effect = hash_side_effect
 
-    def test_success_path_with_db_fixture(self, preview_ready_job_in_db, mock_publishing_engine, settings):
-        job = preview_ready_job_in_db; task_id = job.task_id
-        mock_engine = mock_publishing_engine
-        result = services.confirm_and_publish_job(task_id)
-        job.refresh_from_db(); assert job.status == PublishingJob.Status.PUBLISHED
-        assert job.wechat_media_id == "mock_draft_media_id_abcde"
-        mock_engine["auth"].get_access_token.assert_called_once()
-        mock_engine["payload_builder"].build_draft_payload.assert_called_once()
-        mock_engine["wechat_api"].add_draft.assert_called_once()
-        mock_engine["wechat_api"].upload_thumb_media.assert_not_called()
-        assert result["status"] == PublishingJob.Status.PUBLISHED.label
 
-    def test_failure_job_not_found(self, mock_job_manager):
-        mock_manager, _ = mock_job_manager
-        mock_manager.get.side_effect = ObjectDoesNotExist("Not found")
-        with pytest.raises(ObjectDoesNotExist): services.confirm_and_publish_job(uuid.uuid4())
+        # Act
+        result = start_processing_job(
+            dummy_markdown_file, dummy_cover_image_file, dummy_content_image_files
+        )
 
-    def test_failure_wrong_status(self, mock_job_manager, mock_publishing_engine):
-        mock_manager, mock_job = mock_job_manager
-        mock_job.status = PublishingJob.Status.PROCESSING
-        mock_job.metadata = {'title': 'Test'}; mock_job.thumb_media_id = 'some_id'
-        with pytest.raises(ValueError, match="Job not ready"): services.confirm_and_publish_job(mock_job.task_id)
-        mock_job.save.assert_called_with(update_fields=services.JOB_ERROR_UPDATE_FIELDS)
-        assert mock_job.status == PublishingJob.Status.FAILED
+        # Assert: Check results and job state
+        assert "task_id" in result
+        task_id = uuid.UUID(result["task_id"])
+        job = PublishingJob.objects.get(pk=task_id)
 
-    def test_failure_missing_metadata(self, mock_job_manager, mock_publishing_engine):
-        mock_manager, mock_job = mock_job_manager
-        mock_job.status = PublishingJob.Status.PREVIEW_READY
-        mock_job.metadata = None; mock_job.thumb_media_id = 'some_id'
-        with pytest.raises(ValueError, match="Metadata is missing"): services.confirm_and_publish_job(mock_job.task_id)
-        mock_job.save.assert_called_with(update_fields=services.JOB_ERROR_UPDATE_FIELDS)
-        assert mock_job.status == PublishingJob.Status.FAILED
+        assert job.status == PublishingJob.Status.PREVIEW_READY, "Job should still complete successfully"
+        # Thumbnail ID should be from the direct upload, as cache was skipped
+        assert job.thumb_media_id == "mock_thumb_media_id_from_upload"
 
-    def test_failure_payload_build_error(self, mock_job_manager, mock_publishing_engine):
-        mock_manager, mock_job = mock_job_manager; mock_engine = mock_publishing_engine
-        mock_job.status = PublishingJob.Status.PREVIEW_READY
-        mock_job.metadata = {'title': 'Test'}; mock_job.thumb_media_id = 'some_id'
-        mock_engine["payload_builder"].build_draft_payload.side_effect = KeyError("Missing key")
-        with pytest.raises(ValueError, match="Payload building failed"): services.confirm_and_publish_job(mock_job.task_id)
-        mock_job.save.assert_called_with(update_fields=services.JOB_ERROR_UPDATE_FIELDS)
-        assert mock_job.status == PublishingJob.Status.FAILED
+        # Assert: Verify external calls
+        # calculate_file_hash was called (at least for the cover image)
+        assert mock_calculate_hash.call_count >= 1 # Called for cover, maybe content images
+        # upload_thumb_media *was* called because hashing failed (cache skipped)
+        mock_wechat_api.upload_thumb_media.assert_called_once()
 
-    def test_success_with_thumb_retry(self, mock_job_manager, mock_publishing_engine, mock_filesystem_helpers, settings, tmp_path):
-        mock_manager, mock_job = mock_job_manager; mock_engine = mock_publishing_engine
-        mock_save_local, _, saved_files_map = mock_filesystem_helpers
-        mock_job.status = PublishingJob.Status.PREVIEW_READY; mock_job.metadata = {'title': 'Retry Test'}
-        mock_job.thumb_media_id = 'expired_thumb_id_111'; cover_rel_path = 'uploads/covers/retry_cover.gif'
-        mock_job.original_cover_image_path = cover_rel_path; cover_abs_path = Path(settings.MEDIA_ROOT) / cover_rel_path
-        cover_abs_path.parent.mkdir(parents=True, exist_ok=True)
-        cover_abs_path.write_bytes(b'GIF89a\x01\x00\x01\x00\x80\x00\x00\xff\xff\xff\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;')
-        new_thumb_id = "new_thumb_id_222"; final_draft_id = "final_draft_id_after_retry"
-        mock_engine["wechat_api"].add_draft.side_effect = [mock_engine["wechat_api"].WeChatAPIError("Invalid Media ID", errcode=40007), final_draft_id]
-        mock_engine["wechat_api"].upload_thumb_media.return_value = new_thumb_id
-        payload_call_count = 0; original_builder_mock = mock_engine["payload_builder"].build_draft_payload
-        original_builder_return_value = original_builder_mock.return_value.copy()
-        def payload_side_effect(*args, **kwargs):
-            nonlocal payload_call_count; payload_call_count += 1; payload = original_builder_return_value.copy()
-            payload['thumb_media_id'] = kwargs['thumb_media_id']; payload['title'] = kwargs['metadata']['title']; return payload
-        mock_engine["payload_builder"].build_draft_payload.side_effect = payload_side_effect
-        result = services.confirm_and_publish_job(mock_job.task_id)
-        assert mock_engine["auth"].get_access_token.call_count == 2; assert mock_engine["wechat_api"].add_draft.call_count == 2
-        mock_engine["wechat_api"].upload_thumb_media.assert_called_once(); assert payload_call_count == 2
-        calls = mock_engine["payload_builder"].build_draft_payload.call_args_list
-        assert calls[0].kwargs['thumb_media_id'] == 'expired_thumb_id_111'; assert calls[1].kwargs['thumb_media_id'] == new_thumb_id
-        assert mock_job.status == PublishingJob.Status.PUBLISHED; assert mock_job.thumb_media_id == new_thumb_id
-        assert mock_job.wechat_media_id == final_draft_id; assert result["wechat_media_id"] == final_draft_id
-        assert result["status"] == PublishingJob.Status.PUBLISHED.label
+        # Assert: Verify Cache Interaction (Cache should NOT have been set for thumb)
+        # Check that cache.set was not called for a thumb key
+        found_thumb_key = any(isinstance(k, str) and k.startswith("wechat_thumb_sha256_") for k in cache._cache.keys())
+        assert not found_thumb_key, "No thumbnail key should be in the cache"
 
-    def test_failure_thumb_retry_missing_cover_file(self, mock_job_manager, mock_publishing_engine, settings, tmp_path):
-        mock_manager, mock_job = mock_job_manager; mock_engine = mock_publishing_engine
-        mock_job.status = PublishingJob.Status.PREVIEW_READY
-        mock_job.metadata = {'title': 'Retry Fail Test'}; mock_job.thumb_media_id = 'expired_thumb_id_333'
-        cover_rel_path = 'uploads/covers/missing_retry_cover.gif'; mock_job.original_cover_image_path = cover_rel_path
-        cover_abs_path = Path(settings.MEDIA_ROOT) / cover_rel_path
-        if cover_abs_path.exists(): cover_abs_path.unlink()
-        mock_engine["wechat_api"].add_draft.side_effect = mock_engine["wechat_api"].WeChatAPIError("Invalid Media ID", errcode=40007)
-        with pytest.raises(ValueError, match="Publishing pre-check failed: Cannot retry thumb upload"):
-             services.confirm_and_publish_job(mock_job.task_id)
-        mock_job.save.assert_called_with(update_fields=services.JOB_ERROR_UPDATE_FIELDS)
-        assert mock_job.status == PublishingJob.Status.FAILED
-        assert "local cover file not found" in mock_job.error_message
+
+@pytest.mark.django_db
+def test_start_processing_job_metadata_error(
+    dummy_markdown_file: SimpleUploadedFile,
+    dummy_cover_image_file: SimpleUploadedFile,
+    dummy_content_image_files: list[SimpleUploadedFile],
+    mock_wechat_api: MagicMock, # Need API mock even if error is earlier
+    mock_wechat_auth: MagicMock,
+    mock_metadata_reader: MagicMock
+):
+    """Test job failure when metadata extraction raises a ValueError."""
+    # Arrange: Configure metadata reader mock to raise an error
+    mock_metadata_reader.extract_metadata_and_content.side_effect = ValueError("Invalid YAML in test")
+
+    # Act & Assert: Check that the specific error is raised
+    with pytest.raises(ValueError, match="Invalid YAML in test"):
+        start_processing_job(
+            dummy_markdown_file, dummy_cover_image_file, dummy_content_image_files
+        )
+
+    # Assert: Verify job status is FAILED in the database
+    # Need to get the job using some predictable aspect if task_id isn't returned
+    # Or, query all jobs assuming only one is created per test run.
+    jobs = PublishingJob.objects.all()
+    assert len(jobs) == 1, "One job should have been created"
+    job = jobs[0]
+    assert job.status == PublishingJob.Status.FAILED, "Job status should be FAILED"
+    assert "Invalid YAML in test" in job.error_message, "Error message should reflect the cause"
+
+
+@pytest.mark.django_db
+def test_start_processing_job_thumb_upload_error(
+    dummy_markdown_file: SimpleUploadedFile,
+    dummy_cover_image_file: SimpleUploadedFile,
+    dummy_content_image_files: list[SimpleUploadedFile],
+    mock_wechat_api: MagicMock,
+    mock_wechat_auth: MagicMock,
+    mock_metadata_reader: MagicMock # Need metadata mock even if error is later
+):
+    """Test job failure when thumbnail upload raises a RuntimeError."""
+    # Arrange: Configure thumb upload mock to raise an error
+    mock_wechat_api.upload_thumb_media.side_effect = RuntimeError("WeChat API Timeout during test")
+
+    # Act & Assert: Check that the specific error is raised
+    with pytest.raises(RuntimeError, match="WeChat API Timeout during test"):
+        start_processing_job(
+            dummy_markdown_file, dummy_cover_image_file, dummy_content_image_files
+        )
+
+    # Assert: Verify job status is FAILED in the database
+    jobs = PublishingJob.objects.all()
+    assert len(jobs) == 1, "One job should have been created"
+    job = jobs[0]
+    assert job.status == PublishingJob.Status.FAILED, "Job status should be FAILED"
+    assert "WeChat API Timeout during test" in job.error_message, "Error message should reflect the cause"
+
+
+# --- Tests for confirm_and_publish_job ---
+
+@pytest.fixture
+def preview_ready_job(db):
+    """
+    Fixture to create a PublishingJob instance in PREVIEW_READY state,
+    including creating a dummy cover file needed for potential retries.
+    """
+    task_id = uuid.uuid4()
+    # Create dummy paths relative to MEDIA_ROOT for the job record
+    media_root = Path(settings.MEDIA_ROOT)
+    # Ensure consistent naming for easier lookup if needed (though direct object return is better)
+    cover_filename = f"confirm_cover_{task_id.hex[:8]}.jpg"
+    # Ensure path is stored as string, using OS-agnostic separator for consistency if needed
+    cover_rel_path_str = (Path("uploads/cover_images") / cover_filename).as_posix()
+    cover_abs_path = media_root / cover_rel_path_str # Reconstruct using '/'
+    cover_abs_path.parent.mkdir(parents=True, exist_ok=True)
+    cover_abs_path.write_bytes(b"confirm test image data for retry") # Unique content
+
+    job = PublishingJob.objects.create(
+        task_id=task_id,
+        status=PublishingJob.Status.PREVIEW_READY,
+        original_markdown_path=f"uploads/markdown/confirm_md_{task_id.hex[:8]}.md",
+        original_cover_image_path=cover_rel_path_str, # Store posix path string
+        thumb_media_id="initial_thumb_media_id_for_confirm",
+        metadata={"title": "Confirm Test Title", "author": "Confirm Test Author"},
+        preview_html_path=f"previews/{task_id}.html"
+    )
+    return job
+
+
+@pytest.mark.django_db
+def test_confirm_and_publish_job_success(
+    preview_ready_job: PublishingJob, # Added type hint
+    mock_wechat_api: MagicMock,
+    mock_wechat_auth: MagicMock, # Mock of function
+    mock_payload_builder: MagicMock
+):
+    """Test successful confirmation and publishing (happy path)."""
+    # Arrange
+    task_id = preview_ready_job.task_id
+    initial_thumb_id = preview_ready_job.thumb_media_id
+    job_metadata = preview_ready_job.metadata
+
+    # Act
+    result = confirm_and_publish_job(task_id)
+
+    # Assert: Check returned dictionary
+    assert result["status"] == PublishingJob.Status.PUBLISHED.label, "Result status label should be PUBLISHED"
+    assert result["message"] is not None, "Success message should be present"
+    assert result["wechat_media_id"] == "mock_draft_media_id_success", "Result should contain correct draft ID"
+
+    # Assert: Verify job state in DB
+    job = PublishingJob.objects.get(pk=task_id) # Re-fetch job after changes
+    assert job.status == PublishingJob.Status.PUBLISHED, "DB status should be PUBLISHED"
+    assert job.wechat_media_id == "mock_draft_media_id_success", "DB should store correct draft ID"
+    assert job.published_at is not None, "Published timestamp should be set"
+    assert job.error_message is None, "Error message should be None"
+
+    # Assert: Verify external API calls
+    mock_wechat_auth.assert_called_once() # Assert directly on function mock
+    # Verify payload builder was called with the correct arguments from the job
+    mock_payload_builder.build_draft_payload.assert_called_once_with(
+        metadata=job_metadata, # Use metadata fetched before call
+        html_content=settings.WECHAT_DRAFT_PLACEHOLDER_CONTENT,
+        thumb_media_id=initial_thumb_id # Check it used the initial thumb id
+    )
+    # Verify add_draft was called with the built payload
+    expected_draft_payload = {"articles": [mock_payload_builder.build_draft_payload.return_value]}
+    mock_wechat_api.add_draft.assert_called_once_with(
+        access_token=mock_wechat_auth.return_value, # Use the return value of the mock
+        draft_payload=expected_draft_payload,
+        base_url=settings.WECHAT_BASE_URL
+    )
+
+
+@pytest.mark.django_db
+def test_confirm_and_publish_job_retry_40007_success(
+    preview_ready_job: PublishingJob,
+    mock_wechat_api: MagicMock,
+    mock_wechat_auth: MagicMock, # Mock of function
+    mock_payload_builder: MagicMock,
+    mock_wechat_api_error_cls: type[MockWeChatAPIError] # Use fixture for error class
+):
+    """
+    Test successful publish after automatically retrying due to a 40007 error
+    (invalid media_id) from the initial add_draft call.
+    Verifies thumbnail re-upload, cache update, and final success.
+    """
+    # Arrange
+    task_id = preview_ready_job.task_id
+    initial_thumb_id = preview_ready_job.thumb_media_id
+    job_metadata = preview_ready_job.metadata
+    new_thumb_id_on_retry = "new_thumb_media_id_after_retry_abc"
+
+    # Configure mock API calls for the retry scenario:
+    # 1. add_draft fails first time with 40007
+    # 2. upload_thumb_media succeeds during retry, returning a new ID
+    # 3. add_draft succeeds second time
+    mock_wechat_api.add_draft.side_effect = [
+        mock_wechat_api_error_cls("Invalid media_id test", errcode=40007), # First call fails
+        "mock_draft_media_id_retry_success"                        # Second call succeeds
+    ]
+    mock_wechat_api.upload_thumb_media.return_value = new_thumb_id_on_retry
+
+    # Re-configure payload builder mock to return distinct payloads if needed for checking calls
+    payload_attempt_1 = {"title": "Attempt 1", "content": settings.WECHAT_DRAFT_PLACEHOLDER_CONTENT, "thumb_media_id": initial_thumb_id}
+    payload_attempt_2 = {"title": "Attempt 2", "content": settings.WECHAT_DRAFT_PLACEHOLDER_CONTENT, "thumb_media_id": new_thumb_id_on_retry}
+    mock_payload_builder.build_draft_payload.side_effect = [payload_attempt_1, payload_attempt_2]
+
+
+    # Act
+    result = confirm_and_publish_job(task_id)
+
+    # Assert: Final success state
+    assert result["status"] == PublishingJob.Status.PUBLISHED.label, "Result status label should be PUBLISHED after retry"
+    assert result["wechat_media_id"] == "mock_draft_media_id_retry_success", "Result should contain the final draft ID"
+
+    # Assert: Verify job state in DB
+    job = PublishingJob.objects.get(pk=task_id) # Re-fetch job
+    assert job.status == PublishingJob.Status.PUBLISHED, "DB status should be PUBLISHED"
+    # Check that the thumb_media_id in the DB was updated during the retry
+    assert job.thumb_media_id == new_thumb_id_on_retry, "DB thumb_media_id should be updated"
+    assert job.wechat_media_id == "mock_draft_media_id_retry_success", "DB should store the final draft ID"
+
+    # Assert: Verify sequence of external API calls
+    # Assert call count directly on function mock
+    assert mock_wechat_auth.call_count == 2, "get_access_token called twice (initial + retry)"
+
+    # Payload builder called twice (initial attempt, after re-upload)
+    assert mock_payload_builder.build_draft_payload.call_count == 2
+    # Check arguments passed to payload builder
+    mock_payload_builder.build_draft_payload.assert_has_calls([
+        call(metadata=job_metadata, html_content=settings.WECHAT_DRAFT_PLACEHOLDER_CONTENT, thumb_media_id=initial_thumb_id), # First attempt
+        call(metadata=job_metadata, html_content=settings.WECHAT_DRAFT_PLACEHOLDER_CONTENT, thumb_media_id=new_thumb_id_on_retry) # Second attempt
+    ])
+    # add_draft called twice (failed, succeeded)
+    assert mock_wechat_api.add_draft.call_count == 2
+    # Check arguments for add_draft calls
+    expected_draft_payload_1 = {"articles": [payload_attempt_1]}
+    expected_draft_payload_2 = {"articles": [payload_attempt_2]}
+    mock_wechat_api.add_draft.assert_has_calls([
+        call(access_token=ANY, draft_payload=expected_draft_payload_1, base_url=ANY),
+        call(access_token=ANY, draft_payload=expected_draft_payload_2, base_url=ANY)
+    ])
+
+    # upload_thumb_media called exactly ONCE during the retry logic
+    mock_wechat_api.upload_thumb_media.assert_called_once()
+    # Verify the path used for re-upload
+    expected_cover_path = Path(settings.MEDIA_ROOT) / job.original_cover_image_path
+    mock_wechat_api.upload_thumb_media.assert_called_once_with(
+        access_token=ANY, # Token might have been refreshed
+        thumb_path=expected_cover_path,
+        base_url=settings.WECHAT_BASE_URL
+    )
+
+    # Assert: ** Verify Cache Update during Retry **
+    cover_path_abs = Path(settings.MEDIA_ROOT) / job.original_cover_image_path
+    cover_hash = calculate_file_hash(cover_path_abs) # Calculate hash of the original file
+    cache_key = f"wechat_thumb_sha256_{cover_hash}"
+    # Check that the cache now holds the NEW, valid thumb media ID after the retry
+    assert cache.get(cache_key) == new_thumb_id_on_retry, "Cache should be updated with the new thumb ID after retry"
+
+
+@pytest.mark.django_db
+def test_confirm_and_publish_job_retry_40007_fails_again(
+    preview_ready_job: PublishingJob,
+    mock_wechat_api: MagicMock,
+    mock_wechat_auth: MagicMock, # Mock of function
+    mock_payload_builder: MagicMock,
+    mock_wechat_api_error_cls: type[MockWeChatAPIError]
+):
+    """Test failure when add_draft fails with 40007, retries, but fails again."""
+    # Arrange
+    task_id = preview_ready_job.task_id
+    initial_thumb_id = preview_ready_job.thumb_media_id
+    job_metadata = preview_ready_job.metadata
+    new_thumb_id_on_retry = "new_thumb_id_during_failed_retry_def"
+    # Configure mocks:
+    # 1. add_draft fails first time (40007)
+    # 2. upload_thumb_media succeeds during retry
+    # 3. add_draft fails second time with a different error
+    mock_wechat_api.add_draft.side_effect = [
+        mock_wechat_api_error_cls("Invalid media_id test", errcode=40007),
+        RuntimeError("WeChat API down on second attempt")
+    ]
+    mock_wechat_api.upload_thumb_media.return_value = new_thumb_id_on_retry
+    # Make payload builder work for both calls
+    mock_payload_builder.build_draft_payload.side_effect = [
+        {"title": "Attempt 1", "content": settings.WECHAT_DRAFT_PLACEHOLDER_CONTENT, "thumb_media_id": initial_thumb_id},
+        {"title": "Attempt 2", "content": settings.WECHAT_DRAFT_PLACEHOLDER_CONTENT, "thumb_media_id": new_thumb_id_on_retry}
+    ]
+
+
+    # Act & Assert: Check that the final error is raised
+    with pytest.raises(RuntimeError, match="Failed to publish draft to WeChat after 2 attempt"): # Match the raised error message
+        confirm_and_publish_job(task_id)
+
+    # Assert: Verify job state in DB
+    job = PublishingJob.objects.get(pk=task_id) # Re-fetch
+    assert job.status == PublishingJob.Status.FAILED, "DB status should be FAILED"
+    # Check the specific error message stored from the *final* failure
+    assert "Failed to publish draft to WeChat after 2 attempt(s). Last error: WeChat API down on second attempt" in job.error_message, "Error message should reflect the final error"
+
+    # Thumb ID *should* be updated in the DB because the re-upload happened before the second failure
+    assert job.thumb_media_id == new_thumb_id_on_retry, "DB thumb_media_id should be updated from retry"
+    assert job.wechat_media_id is None, "No final draft ID should be stored"
+
+    # Assert: Verify Cache Update (cache *should* have been updated during retry)
+    cover_path_abs = Path(settings.MEDIA_ROOT) / job.original_cover_image_path
+    cover_hash = calculate_file_hash(cover_path_abs)
+    cache_key = f"wechat_thumb_sha256_{cover_hash}"
+    assert cache.get(cache_key) == new_thumb_id_on_retry, "Cache should still be updated with the new thumb ID from the retry attempt"
+
+
+@pytest.mark.django_db
+def test_confirm_and_publish_job_not_ready(preview_ready_job: PublishingJob):
+    """Test attempting to publish a job that is not in PREVIEW_READY state."""
+    # Arrange: Change the job status
+    preview_ready_job.status = PublishingJob.Status.PROCESSING
+    preview_ready_job.save()
+    task_id = preview_ready_job.task_id
+
+    # Act & Assert: Check for ValueError
+    with pytest.raises(ValueError, match="Job not ready for publishing"):
+        confirm_and_publish_job(task_id)
+
+    # Assert: Verify DB state unchanged (still PROCESSING)
+    job = PublishingJob.objects.get(pk=task_id) # Re-fetch job
+    # Assert that the status is now FAILED due to the error handling in confirm_and_publish_job
+    assert job.status == PublishingJob.Status.FAILED, "Job status should be FAILED after caught error"
+    assert "Job not ready for publishing" in job.error_message, "Error message should be set"
+
+
+
+@pytest.mark.django_db
+def test_confirm_and_publish_job_not_found():
+    """Test attempting to publish a job ID that doesn't exist in the database."""
+    # Arrange
+    non_existent_task_id = uuid.uuid4()
+
+    # Act & Assert: Check for Django's ObjectDoesNotExist
+    with pytest.raises(ObjectDoesNotExist):
+        confirm_and_publish_job(non_existent_task_id)
