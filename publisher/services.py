@@ -361,6 +361,21 @@ def confirm_and_publish_job(task_id: uuid.UUID) -> Dict[str, Any]:
         logger.info(f"[Job {task_id}] Attempting to confirm and publish job.")
         job = PublishingJob.objects.get(pk=task_id)
 
+        # !!!!!!!!!! START DIAGNOSTIC LOGGING (DATABASE) !!!!!!!!!!
+        try:
+            # Access metadata safely using .get()
+            metadata_from_db = job.metadata or {} # Ensure it's a dict
+            title_from_db = metadata_from_db.get('title', 'N/A')
+            digest_from_db = metadata_from_db.get('digest', 'N/A') # Assuming digest might also have issues
+            logger.debug(f"[Job {task_id}] Checking metadata retrieved FROM DB:")
+            logger.debug(f"[Job {task_id}]   Title='{title_from_db}' (Type: {type(title_from_db)})")
+            logger.debug(f"[Job {task_id}]   Digest='{digest_from_db}' (Type: {type(digest_from_db)})")
+            # Log the raw metadata dict as well for comparison
+            logger.debug(f"[Job {task_id}]   Raw job.metadata from DB: {job.metadata}")
+        except Exception as log_ex:
+            logger.error(f"[Job {task_id}] Error logging metadata from DB: {log_ex}")
+        # !!!!!!!!!! END DIAGNOSTIC LOGGING (DATABASE) !!!!!!!!!!
+
         # Pre-flight Checks
         if job.status != PublishingJob.Status.PREVIEW_READY:
             logger.warning(f"[Job {task_id}] Cannot publish job with status '{job.get_status_display()}'. Required status: PREVIEW_READY.")
