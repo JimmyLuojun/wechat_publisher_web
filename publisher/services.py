@@ -67,7 +67,6 @@ def _save_uploaded_file_locally(file_obj: UploadedFile, subfolder: str = "") -> 
         local_save_path_abs = local_save_dir / unique_filename
         with open(local_save_path_abs, 'wb') as destination:
             destination.write(file_content)
-        # relative_path_str = (Path(subfolder) / unique_filename).as_posix() # Not used directly
         logger.info(f"File '{file_obj.name}' saved locally to absolute path: {local_save_path_abs}")
         return local_save_path_abs
     except IOError as e:
@@ -78,7 +77,7 @@ def _save_uploaded_file_locally(file_obj: UploadedFile, subfolder: str = "") -> 
         raise RuntimeError(f"Unexpected failure saving '{file_obj.name}' locally.") from e
 
 
-# _generate_preview_file (Unchanged from previous correction)
+# _generate_preview_file (Unchanged)
 def _generate_preview_file(full_html_content: str, task_id: uuid.UUID) -> str:
     """
     Saves the FULL HTML content to a preview file locally and returns its relative path as a string.
@@ -116,11 +115,11 @@ JOB_PUBLISH_SUCCESS_FIELDS = ['status', 'wechat_media_id', 'error_message', 'pub
 JOB_ERROR_MSG_UPDATE_FIELDS = ['error_message', 'updated_at'] # Added for warning updates
 
 
-# start_processing_job (Modified to process cover image and content images via callback)
+# start_processing_job (Modified preview HTML generation)
 def start_processing_job(
     markdown_file: UploadedFile,
     cover_image: UploadedFile,
-    content_images: List[UploadedFile] # Note: These are side-uploaded, not directly used unless referenced in MD
+    content_images: List[UploadedFile]
 ) -> Dict[str, Any]:
     """
     Handles Request 1: Saves files, processes cover image, uploads/caches cover thumb,
@@ -129,10 +128,10 @@ def start_processing_job(
     job: Optional[PublishingJob] = None
     task_id = uuid.uuid4()
     local_cover_path_abs: Optional[Path] = None
-    processed_cover_path_abs: Optional[Path] = None # Store path after potential processing
+    processed_cover_path_abs: Optional[Path] = None
     local_md_path_abs: Optional[Path] = None
     access_token: Optional[str] = None
-    image_processing_warnings: List[str] = [] # To collect warnings for the response
+    image_processing_warnings: List[str] = []
 
     try:
         logger.info(f"[Job {task_id}] Starting new processing job (Callback workflow)")
@@ -148,7 +147,7 @@ def start_processing_job(
         local_cover_path_abs = _save_uploaded_file_locally(cover_image, subfolder='uploads/cover_images')
         job.original_cover_image_path = local_cover_path_abs.relative_to(settings.MEDIA_ROOT).as_posix()
         logger.info(f"[Job {task_id}] Saved Markdown: '{local_md_path_abs.name}'. Saved Cover: '{local_cover_path_abs.name}'.")
-        job.save(update_fields=JOB_PATHS_UPDATE_FIELDS) # Save original paths first
+        job.save(update_fields=JOB_PATHS_UPDATE_FIELDS)
 
         # --- Step 3.5: Process Cover Image ---
         try:
@@ -156,21 +155,17 @@ def start_processing_job(
             processed_cover_path_abs = ensure_image_size(local_cover_path_abs, COVER_IMAGE_SIZE_LIMIT_KB)
             if processed_cover_path_abs != local_cover_path_abs:
                 logger.info(f"[Job {task_id}] Cover image optimized. Using '{processed_cover_path_abs.name}' for WeChat.")
-                # Optional: Store the processed path if needed later (e.g., for retry without re-processing)
-                # job.processed_cover_image_path = processed_cover_path_abs.relative_to(settings.MEDIA_ROOT).as_posix()
-                # job.save(update_fields=JOB_PROCESSED_PATHS_UPDATE_FIELDS) # Example if storing path
             else:
                  logger.debug(f"[Job {task_id}] Cover image size OK. Using original '{local_cover_path_abs.name}'.")
-                 processed_cover_path_abs = local_cover_path_abs # Ensure it's assigned for subsequent steps
+                 processed_cover_path_abs = local_cover_path_abs
         except (FileNotFoundError, ValueError, ImportError) as img_err:
             logger.error(f"[Job {task_id}] CRITICAL: Failed to process cover image '{local_cover_path_abs.name}': {img_err}", exc_info=True)
-            # Fail the job if cover image processing fails, as it's essential for the thumbnail
             raise RuntimeError(f"Failed to process cover image '{cover_image.name}': {img_err}") from img_err
-        except Exception as e: # Catch any other unexpected error during image processing
+        except Exception as e:
             logger.error(f"[Job {task_id}] CRITICAL: Unexpected error processing cover image '{local_cover_path_abs.name}': {e}", exc_info=True)
             raise RuntimeError(f"Unexpected failure processing cover image '{cover_image.name}': {e}") from e
 
-        # Save side-uploaded content images (processing happens later if referenced in Markdown)
+        # Save side-uploaded content images
         saved_content_image_paths: List[Path] = []
         for image_file in content_images:
             path = _save_uploaded_file_locally(image_file, subfolder='uploads/content_images')
@@ -186,15 +181,13 @@ def start_processing_job(
         if not access_token: raise RuntimeError("Failed to get WeChat access token.")
         logger.debug(f"[Job {task_id}] Retrieved WeChat access token.")
 
-        # Use the *processed* cover image path for hashing and upload
         logger.info(f"[Job {task_id}] Preparing PERMANENT WeChat thumbnail from processed path: '{processed_cover_path_abs}'")
         if not processed_cover_path_abs or not processed_cover_path_abs.is_file():
-             # This check should ideally be redundant due to checks in ensure_image_size
              raise FileNotFoundError(f"Processed cover image not found at expected path: {processed_cover_path_abs}")
 
         # --- Caching Logic Start (Using hash of the *processed* file) ---
         permanent_thumb_media_id: Optional[str] = None
-        cover_image_hash = calculate_file_hash(processed_cover_path_abs, algorithm='sha256') # Hash the processed file
+        cover_image_hash = calculate_file_hash(processed_cover_path_abs, algorithm='sha256')
         if cover_image_hash:
             cache_key = f"wechat_thumb_sha256_{cover_image_hash}"
             logger.debug(f"[Job {task_id}] Checking cache for thumbnail key: {cache_key} (from processed file)")
@@ -205,7 +198,6 @@ def start_processing_job(
             else:
                 logger.info(f"[Job {task_id}] Cache MISS for thumbnail. Uploading processed image '{processed_cover_path_abs.name}' to WeChat...")
                 try:
-                    # Upload the processed file
                     permanent_thumb_media_id = wechat_api.upload_thumb_media(
                         access_token=access_token, thumb_path=processed_cover_path_abs, base_url=base_url
                     )
@@ -218,11 +210,9 @@ def start_processing_job(
                     logger.exception(f"[Job {task_id}] Failed to upload thumbnail '{processed_cover_path_abs.name}': {upload_error}")
                     raise RuntimeError(f"Failed to upload thumbnail to WeChat: {upload_error}") from upload_error
         else:
-            # Handle hash failure (upload processed file directly)
             logger.error(f"[Job {task_id}] Failed to calculate hash for processed cover image {processed_cover_path_abs}, cannot use cache.")
             logger.warning(f"[Job {task_id}] Proceeding with direct thumbnail upload of processed file due to hash failure.")
             try:
-                 # Upload the processed file
                 permanent_thumb_media_id = wechat_api.upload_thumb_media(
                     access_token=access_token, thumb_path=processed_cover_path_abs, base_url=base_url
                 )
@@ -253,217 +243,141 @@ def start_processing_job(
         logger.info(f"[Job {task_id}] Metadata extracted successfully: {metadata_dict}")
 
         # --- Step 5.5: Callback Definition (Processes Content Images) ---
-        # Cache stores tuple: (Optional[str], Optional[str]) -> (wechat_url, error_message)
         callback_upload_cache: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
-
         def _wechat_image_uploader_callback(image_local_path: Path) -> Tuple[Optional[str], Optional[str]]:
-            """
-            Resolves, processes (ensures size limits), uploads (or uses cache) content images.
-            Returns (wechat_url, error_message). error_message is None on success.
-            Adds warnings to the outer scope list `image_processing_warnings`.
-            """
             nonlocal access_token, base_url, callback_upload_cache, image_processing_warnings
-            processed_content_path: Optional[Path] = None # Define scope
-
+            processed_content_path: Optional[Path] = None
             if not access_token or not base_url:
                 err = "Callback invoked without valid access_token or base_url."
                 logger.error(f"[Job {task_id}] {err}")
                 return None, err
-
-            # --- Resolve and Process Content Image ---
             try:
-                # Use image_local_path directly first, as html_processor should resolve it
                 resolved_path = image_local_path
-                if not resolved_path.is_file(): # Double check after resolution by html_processor
-                     # Attempt to resolve strictly if needed (e.g., if html_processor didn't)
-                     try:
-                        resolved_path = image_local_path.resolve(strict=True)
+                if not resolved_path.is_file():
+                     try: resolved_path = image_local_path.resolve(strict=True)
                      except FileNotFoundError:
                           err = f"Callback cannot find image referenced in Markdown: {image_local_path}"
                           logger.error(f"[Job {task_id}] {err}")
                           image_processing_warnings.append(f"Image not found: {image_local_path.name}")
                           return None, err
-
                 logger.debug(f"[Job {task_id}] Ensuring content image '{resolved_path.name}' meets size limit ({CONTENT_IMAGE_SIZE_LIMIT_KB} KB)...")
                 processed_content_path = ensure_image_size(resolved_path, CONTENT_IMAGE_SIZE_LIMIT_KB)
-                if processed_content_path != resolved_path:
-                    logger.info(f"[Job {task_id}] Content image '{resolved_path.name}' optimized. Using '{processed_content_path.name}'.")
-                else:
-                    logger.debug(f"[Job {task_id}] Content image size OK. Using original '{resolved_path.name}'.")
-                    processed_content_path = resolved_path # Ensure assigned
-
-            except FileNotFoundError: # Should be caught above ideally, but as safeguard
-                 err = f"Callback cannot find image file: {image_local_path}"
-                 logger.error(f"[Job {task_id}] {err}")
-                 image_processing_warnings.append(f"Image not found: {image_local_path.name}")
-                 return None, err
-            except (ValueError, ImportError) as img_err: # Catch image processing errors
-                 err = f"Failed to process content image '{image_local_path.name}': {img_err}"
-                 logger.error(f"[Job {task_id}] {err}", exc_info=True) # Log stack trace for processing errors
-                 image_processing_warnings.append(f"Image processing failed: {image_local_path.name} ({type(img_err).__name__})")
-                 return None, err
-            except Exception as process_err: # Catch other resolution/processing errors
-                err = f"Error resolving/processing image path '{image_local_path}': {process_err}"
-                logger.error(f"[Job {task_id}] {err}", exc_info=True)
-                image_processing_warnings.append(f"Image error: {image_local_path.name}")
-                return None, err
-            # --- End Resolve and Process ---
-
-            # --- Caching Logic (Based on Processed Image Hash) ---
+                if processed_content_path != resolved_path: logger.info(f"[Job {task_id}] Content image '{resolved_path.name}' optimized. Using '{processed_content_path.name}'.")
+                else: logger.debug(f"[Job {task_id}] Content image size OK. Using original '{resolved_path.name}'."); processed_content_path = resolved_path
+            except FileNotFoundError:
+                 err = f"Callback cannot find image file: {image_local_path}"; logger.error(f"[Job {task_id}] {err}"); image_processing_warnings.append(f"Image not found: {image_local_path.name}"); return None, err
+            except (ValueError, ImportError) as img_err:
+                 err = f"Failed to process content image '{image_local_path.name}': {img_err}"; logger.error(f"[Job {task_id}] {err}", exc_info=True); image_processing_warnings.append(f"Image processing failed: {image_local_path.name} ({type(img_err).__name__})"); return None, err
+            except Exception as process_err:
+                err = f"Error resolving/processing image path '{image_local_path}': {process_err}"; logger.error(f"[Job {task_id}] {err}", exc_info=True); image_processing_warnings.append(f"Image error: {image_local_path.name}"); return None, err
             content_image_hash = calculate_file_hash(processed_content_path, algorithm='sha256')
-            wechat_url: Optional[str] = None
-            cached_result: Optional[Tuple[Optional[str], Optional[str]]] = None
-
-            if not content_image_hash:
-                logger.warning(f"[Job {task_id}] Could not calculate hash for processed content image {processed_content_path.name}, skipping cache.")
+            wechat_url: Optional[str] = None; cached_result: Optional[Tuple[Optional[str], Optional[str]]] = None
+            if not content_image_hash: logger.warning(f"[Job {task_id}] Could not calculate hash for processed content image {processed_content_path.name}, skipping cache.")
             else:
-                content_cache_key = f"wechat_content_url_sha256_{content_image_hash}"
-                # Check both Django cache and in-memory cache for this request
-                cached_result = cache.get(content_cache_key) or callback_upload_cache.get(content_cache_key)
+                content_cache_key = f"wechat_content_url_sha256_{content_image_hash}"; cached_result = cache.get(content_cache_key) or callback_upload_cache.get(content_cache_key)
                 if cached_result:
                     cached_url, cached_err = cached_result
-                    if cached_url:
-                        logger.debug(f"[Job {task_id}] Cache HIT for content image {processed_content_path.name}. Using URL: {cached_url}")
-                        return cached_url, None # Return cached success
-                    else:
-                         # Previous attempt failed, don't retry automatically via cache hit
-                         logger.warning(f"[Job {task_id}] Cache HIT for {processed_content_path.name}, but previous attempt failed (Error: {cached_err}). Skipping.")
-                         image_processing_warnings.append(f"Image skipped (previous failure): {processed_content_path.name}")
-                         return None, cached_err # Return cached failure
-
+                    if cached_url: logger.debug(f"[Job {task_id}] Cache HIT for content image {processed_content_path.name}. Using URL: {cached_url}"); return cached_url, None
+                    else: logger.warning(f"[Job {task_id}] Cache HIT for {processed_content_path.name}, but previous attempt failed (Error: {cached_err}). Skipping."); image_processing_warnings.append(f"Image skipped (previous failure): {processed_content_path.name}"); return None, cached_err
                 logger.debug(f"[Job {task_id}] Cache MISS for content image {processed_content_path.name} (Key: {content_cache_key})")
-            # --- End Caching Logic ---
-
-            # --- Upload Processed Image ---
             try:
-                logger.debug(f"[Job {task_id}] Uploading processed content image via callback: {processed_content_path.name}")
-                # Use the *processed* path for upload
-                wechat_url = wechat_api.upload_content_image(
-                    access_token=access_token, image_path=processed_content_path, base_url=base_url
-                )
+                logger.debug(f"[Job {task_id}] Uploading processed content image via callback: {processed_content_path.name}"); wechat_url = wechat_api.upload_content_image(access_token=access_token, image_path=processed_content_path, base_url=base_url)
                 if wechat_url:
-                    logger.info(f"[Job {task_id}] Uploaded via callback: {processed_content_path.name} -> {wechat_url}")
-                    result_to_cache = (wechat_url, None) # Success result
-                    if content_image_hash:
-                         cache_timeout = settings.WECHAT_PERMANENT_MEDIA_CACHE_TIMEOUT
-                         cache.set(content_cache_key, result_to_cache, timeout=cache_timeout)
-                         callback_upload_cache[content_cache_key] = result_to_cache
-                         logger.debug(f"[Job {task_id}] Stored success result in cache (Key: {content_cache_key}).")
-                    return wechat_url, None # Return success
+                    logger.info(f"[Job {task_id}] Uploaded via callback: {processed_content_path.name} -> {wechat_url}"); result_to_cache = (wechat_url, None)
+                    if content_image_hash: cache_timeout = settings.WECHAT_PERMANENT_MEDIA_CACHE_TIMEOUT; cache.set(content_cache_key, result_to_cache, timeout=cache_timeout); callback_upload_cache[content_cache_key] = result_to_cache; logger.debug(f"[Job {task_id}] Stored success result in cache (Key: {content_cache_key}).")
+                    return wechat_url, None
                 else:
-                    # API returned no URL, treat as failure
-                    err = f"WeChat API returned no URL for uploaded image: {processed_content_path.name}"
-                    logger.error(f"[Job {task_id}] {err}")
-                    result_to_cache = (None, err) # Failure result
-                    if content_image_hash: # Cache the failure too
-                        cache_timeout = settings.WECHAT_PERMANENT_MEDIA_CACHE_TIMEOUT # Use same timeout?
-                        cache.set(content_cache_key, result_to_cache, timeout=cache_timeout)
-                        callback_upload_cache[content_cache_key] = result_to_cache
-                        logger.debug(f"[Job {task_id}] Stored failure result in cache (Key: {content_cache_key}).")
-                    image_processing_warnings.append(f"Image upload failed (no URL): {processed_content_path.name}")
-                    return None, err # Return failure
-
+                    err = f"WeChat API returned no URL for uploaded image: {processed_content_path.name}"; logger.error(f"[Job {task_id}] {err}"); result_to_cache = (None, err)
+                    if content_image_hash: cache_timeout = settings.WECHAT_PERMANENT_MEDIA_CACHE_TIMEOUT; cache.set(content_cache_key, result_to_cache, timeout=cache_timeout); callback_upload_cache[content_cache_key] = result_to_cache; logger.debug(f"[Job {task_id}] Stored failure result in cache (Key: {content_cache_key}).")
+                    image_processing_warnings.append(f"Image upload failed (no URL): {processed_content_path.name}"); return None, err
             except Exception as e:
-                # Catch API call errors or other unexpected issues during upload
-                err = f"Upload error for {processed_content_path.name}: {e}"
-                logger.exception(f"[Job {task_id}] {err}") # Log stack trace for upload errors
-                result_to_cache = (None, err)
-                if content_image_hash:
-                    cache_timeout = settings.WECHAT_PERMANENT_MEDIA_CACHE_TIMEOUT
-                    cache.set(content_cache_key, result_to_cache, timeout=cache_timeout)
-                    callback_upload_cache[content_cache_key] = result_to_cache
-                    logger.debug(f"[Job {task_id}] Stored unexpected error result in cache (Key: {content_cache_key}).")
-                image_processing_warnings.append(f"Image upload error: {processed_content_path.name} ({type(e).__name__})")
-                return None, err # Return failure
-            # --- End Upload Processed Image ---
+                err = f"Upload error for {processed_content_path.name}: {e}"; logger.exception(f"[Job {task_id}] {err}"); result_to_cache = (None, err)
+                if content_image_hash: cache_timeout = settings.WECHAT_PERMANENT_MEDIA_CACHE_TIMEOUT; cache.set(content_cache_key, result_to_cache, timeout=cache_timeout); callback_upload_cache[content_cache_key] = result_to_cache; logger.debug(f"[Job {task_id}] Stored unexpected error result in cache (Key: {content_cache_key}).")
+                image_processing_warnings.append(f"Image upload error: {processed_content_path.name} ({type(e).__name__})"); return None, err
 
         # --- Step 6: Process HTML Fragment ---
         logger.info(f"[Job {task_id}] Processing HTML fragment from Markdown body using uploader callback...")
-        if not local_md_path_abs:
-             raise FileNotFoundError("Markdown file path missing before HTML processing.")
+        if not local_md_path_abs: raise FileNotFoundError("Markdown file path missing before HTML processing.")
         markdown_body_content = markdown_body_content or ""
 
-        # Adapter function to bridge the callback return type difference
         def adapted_uploader(local_path: Path) -> Optional[str]:
-            """Adapts the callback result for the html_processor interface."""
             url, error = _wechat_image_uploader_callback(local_path)
-            # The error/warning logging is handled inside _wechat_image_uploader_callback
-            if error:
-                return None # Signal failure to html_processor
+            if error: return None
             return url
 
-        # Get CSS path (logic remains the same)
         css_path_setting = getattr(settings, 'PREVIEW_CSS_FILE_PATH', None)
         css_path_str: Optional[str] = None
         if css_path_setting:
             css_path = Path(css_path_setting)
-            if not css_path.is_absolute() and hasattr(settings, 'BASE_DIR'):
-                css_path = Path(settings.BASE_DIR) / css_path
-            if css_path.is_file():
-                css_path_str = str(css_path)
-                logger.debug(f"[Job {task_id}] Using preview CSS file: {css_path_str}")
-            else:
-                logger.warning(f"[Job {task_id}] Preview CSS file configured but not found at {css_path}. No CSS applied.")
-        else:
-            logger.info("[Job {task_id}] No PREVIEW_CSS_FILE_PATH configured.")
+            if not css_path.is_absolute() and hasattr(settings, 'BASE_DIR'): css_path = Path(settings.BASE_DIR) / css_path
+            if css_path.is_file(): css_path_str = str(css_path); logger.debug(f"[Job {task_id}] Using preview CSS file: {css_path_str}")
+            else: logger.warning(f"[Job {task_id}] Preview CSS file configured but not found at {css_path}. Cannot embed CSS."); css_path_str = None
+        else: logger.info("[Job {task_id}] No PREVIEW_CSS_FILE_PATH configured.")
 
-        # Call html_processor with the adapted uploader
         processed_html_fragment = html_processor.process_html_content(
-            md_content=markdown_body_content,
-            css_path=css_path_str,
-            markdown_file_path=local_md_path_abs,
-            image_uploader=adapted_uploader # Use the adapted uploader
+            md_content=markdown_body_content, css_path=css_path_str, markdown_file_path=local_md_path_abs, image_uploader=adapted_uploader
         )
         logger.info(f"[Job {task_id}] HTML fragment processed.")
         if image_processing_warnings:
-            logger.warning(f"[Job {task_id}] Issues encountered during image processing: {len(image_processing_warnings)} warning(s). See details above.")
-            # Store summary in job record
             warning_summary = "; ".join(image_processing_warnings)
-            job.error_message = warning_summary[:1000] # Truncate if needed for DB field size
-            job.save(update_fields=JOB_ERROR_MSG_UPDATE_FIELDS)
+            logger.warning(f"[Job {task_id}] Issues encountered during image processing: {len(image_processing_warnings)} warning(s). Summary: {warning_summary[:200]}...")
+            job.error_message = warning_summary[:1000]; job.save(update_fields=JOB_ERROR_MSG_UPDATE_FIELDS)
 
 
         # --- Step 7 & 8: Wrap Full HTML, Generate Preview, Finalize ---
-        preview_title = metadata_dict.get("title", f"Preview - {task_id}")
-        # Basic HTML structure for preview (can be customized)
+        preview_page_title = metadata_dict.get("title", "Article Preview")
+        article_html_content = processed_html_fragment
+
+        # --- REFINED HTML STRUCTURE for Preview (Embed CSS, Center Body) ---
+        # Note: This structure assumes `processed_html_fragment` contains the <div id="nice">...</div> wrapper
         full_html_for_preview = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{preview_title}</title>
-    <style>
-        body {{ font-family: sans-serif; line-height: 1.6; padding: 20px; max-width: 800px; margin: auto; }}
-        img {{ max-width: 100%; height: auto; display: block; margin: 10px 0; border: 1px solid #eee; }} /* Added border */
-        h1, h2, h3 {{ margin-top: 1.5em; }}
-        /* Add styles from html_processor if needed, or link to external CSS */
+    <title>{preview_page_title}</title>
+    <style type="text/css">
+        /* Style to center the preview body */
+        body {{
+            max-width: 800px; /* Reading width */
+            margin: 20px auto; /* Centering with top/bottom margin */
+            padding: 0 15px; /* Side padding */
+            box-sizing: border-box;
+            background-color: #fdfdfd; /* Light off-white background */
+            color: #333; /* Default text color for body */
+            font-family: sans-serif; /* Basic fallback font for body */
+            line-height: 1.6; /* Basic line height for body */
+        }}
+        /* Add a little space above the main #nice content */
+        #nice {{
+             margin-top: 1em; /* Adjust as needed */
+        }}
+
+        /* --- Embedded CSS from style.css below --- */
+{ # Embed CSS content from file if path is valid
+  (Path(css_path_str).read_text(encoding="utf-8") if css_path_str else '/* No external CSS file provided or found */')
+}
     </style>
 </head>
 <body>
-    <h1>{preview_title}</h1>
-    <hr>
-    {processed_html_fragment}
+    {article_html_content}
 </body>
 </html>"""
+        # --- End of REFINED HTML Structure ---
+
         preview_path_rel_str = _generate_preview_file(full_html_for_preview, task_id)
         job.preview_html_path = preview_path_rel_str
         job.status = PublishingJob.Status.PREVIEW_READY
-        # Clear previous errors only if successful now, otherwise keep warnings
-        if not image_processing_warnings:
-             job.error_message = None
+        if not image_processing_warnings: job.error_message = None
         job.save(update_fields=JOB_PREVIEW_UPDATE_FIELDS + ['error_message'])
 
-        # Construct preview URL
         media_url = settings.MEDIA_URL.rstrip('/') + '/' if settings.MEDIA_URL else '/media/'
         preview_url_path = preview_path_rel_str.lstrip('/')
         preview_url = media_url + preview_url_path
         logger.info(f"[Job {task_id}] Preview ready. Accessible at: {preview_url}")
 
-        # Modify return value to include warnings
         final_result = {"task_id": str(job.task_id), "preview_url": preview_url}
-        if image_processing_warnings:
-            final_result["warnings"] = image_processing_warnings
-
+        if image_processing_warnings: final_result["warnings"] = image_processing_warnings
         return final_result
 
     # --- Exception Handling ---
@@ -472,7 +386,7 @@ def start_processing_job(
         err_msg = f"Required file not found: {e}"
         if job: job.status = PublishingJob.Status.FAILED; job.error_message = err_msg; job.save(update_fields=JOB_ERROR_UPDATE_FIELDS)
         raise FileNotFoundError(err_msg) from e
-    except (ValueError, yaml.YAMLError) as e: # ValueError can come from image processing too
+    except (ValueError, yaml.YAMLError) as e:
         logger.error(f"[Job {task_id}] Value/YAML/Image Error: {e}", exc_info=True)
         err_msg = f"Invalid data, config, or image processing failed: {e}"
         if job: job.status = PublishingJob.Status.FAILED; job.error_message = err_msg; job.save(update_fields=JOB_ERROR_UPDATE_FIELDS)
@@ -488,10 +402,10 @@ def start_processing_job(
         if job:
             try: job.status = PublishingJob.Status.FAILED; job.error_message = err_msg; job.save(update_fields=JOB_ERROR_UPDATE_FIELDS)
             except Exception as db_err: logger.critical(f"[Job {task_id}] CRITICAL: Failed to update job status after error: {db_err}", exc_info=True)
-        raise # Re-raise the original exception
+        raise
 
 
-# confirm_and_publish_job (Modified for re-processing cover image on retry)
+# confirm_and_publish_job (Unchanged from previous version)
 def confirm_and_publish_job(task_id: uuid.UUID) -> Dict[str, Any]:
     """
     Handles Request 2: Confirms job, builds payload, publishes draft, handles 40007 retry.
@@ -572,27 +486,24 @@ def confirm_and_publish_job(task_id: uuid.UUID) -> Dict[str, Any]:
 
             except Exception as e:
                 # --- Diagnostic Logging for Exception ---
-                logger.error(f"[Job {task_id}] Caught exception during add_draft: {type(e).__name__} - {e}", exc_info=False) # Log basic info first
+                logger.error(f"[Job {task_id}] Caught exception during add_draft: {type(e).__name__} - {e}", exc_info=False)
                 errcode = None
                 try:
                     logger.debug(f"[Job {task_id}] Exception details: args={e.args}")
-                    # Try to get errcode robustly
                     if hasattr(e, 'errcode'): errcode = getattr(e, 'errcode')
                     elif hasattr(e, 'code'): errcode = getattr(e, 'code')
-                    elif len(e.args) > 0 and isinstance(e.args[0], dict) and 'errcode' in e.args[0]: errcode = e.args[0]['errcode'] # Check dict in args
-                    elif isinstance(e, RuntimeError) and '40007' in str(e): errcode = 40007 # Manual check for specific known string
+                    elif len(e.args) > 0 and isinstance(e.args[0], dict) and 'errcode' in e.args[0]: errcode = e.args[0]['errcode']
+                    elif isinstance(e, RuntimeError) and '40007' in str(e): errcode = 40007
                     logger.error(f"[Job {task_id}]   Detected errcode: {errcode}")
-                    if hasattr(e, 'response'): logger.error(f"[Job {task_id}]   Response attribute available.") # Indicate if response exists
+                    if hasattr(e, 'response'): logger.error(f"[Job {task_id}]   Response attribute available.")
                 except Exception as log_err:
                     logger.error(f"[Job {task_id}] Error during diagnostic logging of exception details: {log_err}")
 
                 # --- Error Identification for Retry ---
-                # Check for media_id invalid or expired (40007)
                 is_thumb_error = (errcode == 40007)
 
                 if is_thumb_error and attempt <= max_retries:
                     logger.warning(f"[Job {task_id}] Identified thumb error (Code 40007) on attempt {attempt}. Re-processing and re-uploading thumbnail...")
-
                     # --- Retry Logic: Re-process and Re-upload Thumbnail ---
                     logger.info(f"[Job {task_id}] --- Starting Thumb Re-process & Re-upload ---")
                     if not job.original_cover_image_path:
@@ -610,96 +521,72 @@ def confirm_and_publish_job(task_id: uuid.UUID) -> Dict[str, Any]:
                     try:
                         logger.info(f"[Job {task_id}] Re-processing original cover image '{local_cover_path_abs.name}' for retry...")
                         processed_cover_path_retry = ensure_image_size(local_cover_path_abs, COVER_IMAGE_SIZE_LIMIT_KB)
-                        if processed_cover_path_retry != local_cover_path_abs:
-                            logger.info(f"[Job {task_id}] Original cover image optimized during retry to '{processed_cover_path_retry.name}'.")
-                        else:
-                             logger.debug(f"[Job {task_id}] Original cover image size OK during retry.")
-                             processed_cover_path_retry = local_cover_path_abs # Ensure assigned
+                        if processed_cover_path_retry != local_cover_path_abs: logger.info(f"[Job {task_id}] Original cover image optimized during retry to '{processed_cover_path_retry.name}'.")
+                        else: logger.debug(f"[Job {task_id}] Original cover image size OK during retry."); processed_cover_path_retry = local_cover_path_abs
                     except (FileNotFoundError, ValueError, ImportError) as img_err:
                         logger.error(f"[Job {task_id}] CRITICAL: Failed to re-process cover image during retry: {img_err}", exc_info=True)
                         raise RuntimeError(f"Failed to re-process cover image during retry: {img_err}") from img_err
-                    except Exception as img_err_other: # Catch any other unexpected error
+                    except Exception as img_err_other:
                          logger.error(f"[Job {task_id}] CRITICAL: Unexpected error re-processing cover image during retry: {img_err_other}", exc_info=True)
                          raise RuntimeError(f"Unexpected failure re-processing cover image during retry: {img_err_other}") from img_err_other
 
                     # --- Get fresh token ---
                     logger.debug(f"[Job {task_id}] Getting fresh access token for retry...")
-                    access_token = auth.get_access_token(app_id=app_id, app_secret=secret, base_url=base_url) # No force_refresh needed usually
-                    if not access_token:
-                        logger.error(f"[Job {task_id}] Failed to get fresh WeChat token for retry.")
-                        raise RuntimeError("Failed to get fresh WeChat token for retry.")
+                    access_token = auth.get_access_token(app_id=app_id, app_secret=secret, base_url=base_url)
+                    if not access_token: logger.error(f"[Job {task_id}] Failed to get fresh WeChat token for retry."); raise RuntimeError("Failed to get fresh WeChat token for retry.")
                     logger.debug(f"[Job {task_id}] Retrieved fresh access token for retry.")
 
                     # --- Re-upload using the API ---
                     logger.info(f"[Job {task_id}] Re-uploading *processed* thumbnail from: {processed_cover_path_retry}")
                     new_thumb_media_id = None
                     try:
-                        # Upload the potentially newly processed file
-                        new_thumb_media_id = wechat_api.upload_thumb_media(
-                            access_token=access_token, thumb_path=processed_cover_path_retry, base_url=base_url
-                        )
+                        new_thumb_media_id = wechat_api.upload_thumb_media(access_token=access_token, thumb_path=processed_cover_path_retry, base_url=base_url)
                     except Exception as upload_retry_err:
                         logger.error(f"[Job {task_id}] Exception during thumbnail re-upload: {upload_retry_err}", exc_info=True)
                         raise RuntimeError(f"Failed during thumbnail re-upload attempt: {upload_retry_err}") from upload_retry_err
 
-                    if not new_thumb_media_id:
-                        err_retry = "Failed to re-upload permanent thumbnail during retry (API returned no ID)."
-                        logger.error(f"[Job {task_id}] {err_retry}")
-                        raise RuntimeError(err_retry)
+                    if not new_thumb_media_id: err_retry = "Failed to re-upload permanent thumbnail during retry (API returned no ID)."; logger.error(f"[Job {task_id}] {err_retry}"); raise RuntimeError(err_retry)
                     logger.info(f"[Job {task_id}] New thumb media ID obtained: {new_thumb_media_id}.")
 
                     # --- Update DB and Cache ---
                     job.thumb_media_id = new_thumb_media_id
-                    current_thumb_media_id = new_thumb_media_id # Use this new ID for the next attempt
+                    current_thumb_media_id = new_thumb_media_id
                     job.save(update_fields=JOB_THUMB_UPDATE_FIELDS)
                     logger.info(f"[Job {task_id}] Updated job record with new thumb_media_id: {new_thumb_media_id}")
-
-                    # Use hash of the *processed* file for the cache key
                     cover_image_hash_retry = calculate_file_hash(processed_cover_path_retry, algorithm='sha256')
                     if cover_image_hash_retry:
-                        cache_key_retry = f"wechat_thumb_sha256_{cover_image_hash_retry}"
-                        cache_timeout = settings.WECHAT_PERMANENT_MEDIA_CACHE_TIMEOUT
+                        cache_key_retry = f"wechat_thumb_sha256_{cover_image_hash_retry}"; cache_timeout = settings.WECHAT_PERMANENT_MEDIA_CACHE_TIMEOUT
                         cache.set(cache_key_retry, new_thumb_media_id, timeout=cache_timeout)
                         logger.info(f"[Job {task_id}] Updated cache with new valid thumbnail Media ID (Key: {cache_key_retry}).")
-                    else:
-                         logger.warning(f"[Job {task_id}] Could not calculate hash for processed cover image during retry, cache not updated.")
+                    else: logger.warning(f"[Job {task_id}] Could not calculate hash for processed cover image during retry, cache not updated.")
 
-                    # --- Re-build payload with the new thumb_media_id ---
+                    # --- Re-build payload ---
                     logger.info(f"[Job {task_id}] Re-building payload with new thumb media ID ({current_thumb_media_id}) for retry.")
                     try:
-                        article_payload = payload_builder.build_draft_payload(
-                            metadata=job.metadata,
-                            html_content=placeholder_content,
-                            thumb_media_id=current_thumb_media_id # Use the NEWLY obtained ID
-                        )
-                        final_draft_payload = {"articles": [article_payload]} # Update the payload for the next loop iteration
+                        article_payload = payload_builder.build_draft_payload(metadata=job.metadata, html_content=placeholder_content, thumb_media_id=current_thumb_media_id)
+                        final_draft_payload = {"articles": [article_payload]}
                         logger.debug(f"[Job {task_id}] Payload rebuilt successfully for retry.")
                     except (KeyError, ValueError) as build_err:
                         logger.error(f"[Job {task_id}] Failed to re-build draft payload during retry: {build_err}", exc_info=True)
-                        # Re-raise specific error, will be caught by outer loop and prevent further retries if needed
                         raise ValueError(f"Payload re-building failed during retry: {build_err}") from build_err
-
                     logger.info(f"[Job {task_id}] --- Finished Thumb Re-process & Re-upload ---")
-                    continue # Retry the add_draft call with the new payload/thumb_id
+                    continue # Retry add_draft
 
                 else:
-                    # Error is not the specific 40007, OR retries exhausted, OR error occurred during retry steps themselves
+                    # Non-retryable error or retries exhausted
                     logger.error(f"[Job {task_id}] Non-retryable error or retries exhausted. Error: {type(e).__name__}, Code: {errcode}, Attempt: {attempt}", exc_info=False)
                     err_msg_publish = f"Failed to publish draft to WeChat after {attempt} attempt(s). Last error: {type(e).__name__} (Code: {errcode or 'N/A'})"
-                    # Raise a runtime error to be caught by the main exception handler
                     raise RuntimeError(err_msg_publish) from e
             # --- End Exception Block for add_draft attempt ---
         # --- End While Loop for Retries ---
 
-        # --- Common Success Path ---
         if not final_media_id:
-             # This case should ideally not be reached if errors are raised correctly
              logger.error(f"[Job {task_id}] Logic error: Publishing loop finished but final WeChat media ID was not obtained.")
              raise RuntimeError("Publishing finished but final WeChat media ID was not obtained.")
 
         job.status = PublishingJob.Status.PUBLISHED
         job.wechat_media_id = final_media_id
-        job.error_message = None # Clear any previous warnings on successful publish
+        job.error_message = None # Clear previous warnings
         job.published_at = timezone.now()
         job.save(update_fields=JOB_PUBLISH_SUCCESS_FIELDS)
         status_display = job.get_status_display()
@@ -714,24 +601,23 @@ def confirm_and_publish_job(task_id: uuid.UUID) -> Dict[str, Any]:
     # --- Exception Handling ---
     except ObjectDoesNotExist:
         logger.warning(f"Publishing job with task_id {task_id} not found in database.")
-        raise # Re-raise for the view to handle as 404
-    except (ValueError, FileNotFoundError) as e: # Includes issues from pre-checks, payload building, image processing during retry
+        raise
+    except (ValueError, FileNotFoundError) as e:
         logger.error(f"[Job {task_id}] Pre-condition or data error during publish: {e}", exc_info=True)
         err_msg = f"Publishing pre-check or setup failed: {e}"
         if job and job.status not in [PublishingJob.Status.PUBLISHED, PublishingJob.Status.FAILED]:
              job.status = PublishingJob.Status.FAILED; job.error_message = err_msg
              job.save(update_fields=JOB_ERROR_UPDATE_FIELDS)
-        # Re-raise as specific type for potentially different handling in the view
         if isinstance(e, FileNotFoundError): raise FileNotFoundError(err_msg) from e
         else: raise ValueError(err_msg) from e
-    except RuntimeError as e: # Includes API call failures (non-retryable), token issues, retry process failures
+    except RuntimeError as e:
         logger.error(f"[Job {task_id}] Runtime error during publish operation: {e}", exc_info=True)
         err_msg = str(e)
         if job and job.status not in [PublishingJob.Status.PUBLISHED, PublishingJob.Status.FAILED]:
              job.status = PublishingJob.Status.FAILED; job.error_message = err_msg
              job.save(update_fields=JOB_ERROR_UPDATE_FIELDS)
-        raise RuntimeError(err_msg) from e # Re-raise for the view (likely 50x error)
-    except Exception as e: # Catch-all for unexpected errors
+        raise RuntimeError(err_msg) from e
+    except Exception as e:
         logger.exception(f"[Job {task_id}] Unexpected error during confirmation/publishing: {e}")
         err_msg = "An unexpected internal error occurred during publishing."
         if job and job.status not in [PublishingJob.Status.PUBLISHED, PublishingJob.Status.FAILED]:
@@ -740,4 +626,4 @@ def confirm_and_publish_job(task_id: uuid.UUID) -> Dict[str, Any]:
                 job.save(update_fields=JOB_ERROR_UPDATE_FIELDS)
             except Exception as db_err:
                  logger.critical(f"[Job {task_id}] CRITICAL: Failed to update job status after publishing error: {db_err}", exc_info=True)
-        raise # Re-raise the original exception for a 500 error
+        raise # Re-raise
