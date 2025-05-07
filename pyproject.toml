@@ -59,6 +59,7 @@ pydantic = "^2.0" # Keep if used, otherwise remove
 # publishing_engine = { git = "ssh://git@github.com/your_org/publishing_engine.git", branch = "main" }
 django-storages = "^1.14.6"
 google-cloud-storage = "^3.1.0"
+lxml = "^5.4.0"
 
 
 [tool.poetry.group.dev.dependencies]
@@ -67,6 +68,7 @@ pytest = "^8.2.0" # Updated pytest constraint example
 pytest-django = "^4.8.0" # Updated pytest-django constraint example
 pytest-mock = "^3.12.0" # Updated pytest-mock constraint example
 mixer = "^7.2.2" # For creating model instances in tests
+freezegun = "^1.5.1" # Moved here from misplaced section, was already present
 
 # Frontend/E2E Testing (Added based on previous request)
 pytest-playwright = "^0.5.0" # Updated pytest-playwright constraint example
@@ -81,10 +83,7 @@ django-stubs = "^4.2.7" # Optional: Type stubs for Django (use with mypy)
 # Coverage Reporting
 coverage = {extras = ["toml"], version = "^7.5.0"} # Test coverage tool
 
-
 # Build system - Standard, usually no need to change
-pillow = ">=11.2.1,<12.0.0"
-freezegun = "^1.5.1"
 [build-system]
 requires = ["poetry-core>=1.0.0"]
 build-backend = "poetry.core.masonry.api"
@@ -93,7 +92,7 @@ build-backend = "poetry.core.masonry.api"
 # --- Tool Configurations (Optional but Recommended) ---
 
 [tool.pytest.ini_options]
-DJANGO_SETTINGS_MODULE = "wechat_publisher_web.settings" 
+DJANGO_SETTINGS_MODULE = "wechat_publisher_web.settings"
 # Crucial for pytest-django
 # testpaths = ["tests"] # Specify where tests are located (optional, default is auto-detect)
 python_files = "tests.py test_*.py *_test.py" # Test file discovery patterns
