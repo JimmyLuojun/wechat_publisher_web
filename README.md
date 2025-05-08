@@ -116,7 +116,7 @@
     python manage.py runserver
     ```
 2.  **访问应用:**
-    打开浏览器并访问 `http://127.0.0.1:8000/publisher/upload/` (或您的主应用入口 URL)。
+    打开浏览器并访问 `http://127.0.0.1:8000/` (或您的主应用入口 URL)。
 
 ## 使用指南
 
