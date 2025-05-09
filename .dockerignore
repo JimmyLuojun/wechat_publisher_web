@@ -1,0 +1,70 @@
+# .dockerignore
+
+# Git stuff
+.git
+.gitignore
+
+# Docker stuff
+Dockerfile
+.dockerignore
+
+# Python cache and virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
+venv/
+ENV/
+
+# IDE and OS specific
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Test artifacts
+.coverage*
+htmlcov/
+.pytest_cache/
+.tox/
+.nox/
+
+# Local config / Secrets (should use env vars)
+.env*
+local_settings.py
+instance/
+secrets/
+
+# Django runtime data (should not be in image)
+db.sqlite3*
+media/
+staticfiles/ # Exclude locally generated staticfiles; use collectstatic in Dockerfile
+cache/
+logs/
+*.log
+
+# Celery / Redis runtime files
+celerybeat-schedule
+celerybeat.pid
+*.rdb
+*.aof
+
+# Distribution / packaging
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
